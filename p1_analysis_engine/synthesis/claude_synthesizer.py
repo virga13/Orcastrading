@@ -42,6 +42,9 @@ SETUPS_RULES = """
 TRADE SETUP RULES (mandatory — violating any makes the output invalid):
 1. MINIMUM R:R: Never generate a setup with rr_ratio below 1.5.
 2. STRUCTURAL STOP LOSS: SL must be placed just beyond a named key level. Never arbitrary distances.
+   TIMEFRAME BUFFER: For 1d/1wk intervals, SL must be at least 0.5× ATR beyond the key level.
+   For 30m/1h intervals, at least 0.25× ATR. Tight stops on higher timeframes are hit by normal
+   daily noise before the setup can develop — this is not a soft guideline, it is a hard floor.
 3. TRAILING SL TO BREAKEVEN: Set trailing_sl_to_breakeven at TP1 price or nearest midpoint between entry and TP1.
 4. TRADE TYPE: Exactly one of: "scalp" (minutes-hours), "intraday" (within session), "swing" (days-weeks).
 5. INVALIDATION SCENARIO: Exactly one node — price/condition that collapses the entire thesis. NOT a trade setup.
@@ -56,7 +59,17 @@ TRADE SETUP RULES (mandatory — violating any makes the output invalid):
     Do NOT reference VIX for sizing — VIX is macro context only.
 11. WIN RATE: Round numbers only (45%, 50%, 55%, 60%). No false precision like 57.3%.
     Trend-following: 50-60%, counter-trend: 40-50%, breakout: 45-55%.
-12. TARGETS: Split across 2-3 levels (e.g. 50/30/20). TP1 is always the nearest key level."""
+12. TARGETS: Split across 2-3 levels (e.g. 50/30/20). TP1 is always the nearest key level.
+13. BREAKOUT ENTRIES ON DAILY/WEEKLY: Do not generate breakout entries (conditional setups that
+    trigger above resistance or below support) on 1d or 1wk intervals unless the entry condition
+    is explicitly a confirmed CLOSE beyond the level — not an intrabar touch. Intraday wicks
+    routinely exceed key levels without closing there, making touch-based breakout entries
+    systematically unprofitable on these timeframes. If a confirmed-close entry cannot be
+    expressed cleanly, omit the breakout setup and note it in the decision tree instead.
+14. COUNTER-TREND PROXIMITY GATE: Counter-trend setups (bounces at support, fades at resistance)
+    are only valid when the current price is within 0.25× ATR of the key level being traded.
+    If price is not already near the level, omit the counter-trend setup entirely — do not
+    generate a setup that requires price to travel significantly before the entry is relevant."""
 
 COMBINED_SYSTEM_PROMPT = BIAS_SYSTEM_PROMPT + "\n" + SETUPS_RULES
 

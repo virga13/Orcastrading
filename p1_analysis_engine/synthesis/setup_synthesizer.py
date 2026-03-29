@@ -8,6 +8,9 @@ Given a structured market bias analysis, generate 2-4 concrete trade setups, one
 MANDATORY RULES — violating any of these makes the output invalid:
 1. MINIMUM R:R: Never generate a setup with rr_ratio below 1.5. If a setup would be below 1.5R, do not include it.
 2. STRUCTURAL STOP LOSS: SL must be placed just beyond a named key level from the data. Never arbitrary pip distances.
+   TIMEFRAME BUFFER: For 1d/1wk intervals, SL must be at least 0.5× ATR beyond the key level.
+   For 30m/1h intervals, at least 0.25× ATR. Tight stops on higher timeframes are hit by normal
+   daily noise before the setup can develop — this is a hard floor, not a soft guideline.
 3. TRAILING SL TO BREAKEVEN: Set trailing_sl_to_breakeven at TP1 price or the nearest structural midpoint between entry and TP1. This is the price at which you move SL to breakeven.
 4. TRADE TYPE: Classify each setup as exactly one of: "scalp" (minutes to hours, ATR-based tight SL), "intraday" (holds within session, respects session structure), "swing" (days to weeks, holds through noise).
 5. INVALIDATION SCENARIO: Generate exactly one invalidation node — a price/condition that, if triggered, collapses the entire thesis and means standing aside completely. This is NOT a trade setup.
@@ -17,7 +20,17 @@ MANDATORY RULES — violating any of these makes the output invalid:
 9. DECISION TREE: 4-6 scenarios covering all plausible next price actions including the invalidation trigger. Each scenario must be a distinct price action event (rejection, breakout, consolidation, gap, etc.), not generic descriptions.
 10. POSITION SIZING NOTE: Reference the ATR% value explicitly. Warn if ATR% > 2% (reduce size 50-70%). Do NOT reference VIX for sizing decisions — VIX is macro context only.
 11. WIN RATE: Use round numbers only (e.g. 45%, 50%, 55%, 60%). Do not use false precision like 57.3%. Base on setup type: trend-following 50-60%, counter-trend 40-50%, breakout 45-55%.
-12. Targets: split position across 2-3 levels with logical allocation (e.g. 50/30/20). TP1 is always the nearest key level."""
+12. Targets: split position across 2-3 levels with logical allocation (e.g. 50/30/20). TP1 is always the nearest key level.
+13. BREAKOUT ENTRIES ON DAILY/WEEKLY: Do not generate breakout entries (conditional setups that
+    trigger above resistance or below support) on 1d or 1wk intervals unless the entry condition
+    is explicitly a confirmed CLOSE beyond the level — not an intrabar touch. Intraday wicks
+    routinely exceed key levels without closing there, making touch-based breakout entries
+    systematically unprofitable on these timeframes. If a confirmed-close entry cannot be
+    expressed cleanly, omit the breakout setup and note it in the decision tree instead.
+14. COUNTER-TREND PROXIMITY GATE: Counter-trend setups (bounces at support, fades at resistance)
+    are only valid when the current price is within 0.25× ATR of the key level being traded.
+    If price is not already near the level, omit the counter-trend setup entirely — do not
+    generate a setup that requires price to travel significantly before the entry is relevant."""
 
 
 def generate_setups(bias: BiasOutput, model: str = "claude-sonnet-4-6", interval: str = "1d", extended_thinking: bool = False) -> SetupsOutput:
