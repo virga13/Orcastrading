@@ -100,10 +100,89 @@ Trade setups and decision trees are currently generated as part of the P1 HTML r
 
 ---
 
-### P3 — Historical Strategy Backtester `[PLANNED]`
-**Historical EV per setup, win rate, profit factor, drawdown, strategy comparison**
+### P3 — Historical Strategy Backtester `[COMPLETE]`
+**Validates P1 trade setups against historical OHLCV data — actual vs Claude-estimated win rate, EV, profit factor, drawdown**
 
-Validates setups generated in P1/P2 against historical data. Outputs expected value per setup, win rate, profit factor, drawdown metrics, and side-by-side strategy comparisons.
+Two-pass architecture that separates expensive signal generation (Pass 1) from free, re-runnable trade simulation (Pass 2).
+
+#### How it works
+
+**Pass 1 — Signal Generation** (runs Claude API once per signal bar)
+- Iterates over historical bars at the selected signal mode
+- At each signal bar, slices the OHLCV data to that point only (zero lookahead)
+- Recomputes all technical indicators on the slice (same logic as P1 fetcher)
+- Calls `synthesize_full` to generate bias + trade setups
+- Caches the full output as JSON — skipped on re-runs unless `--force-regenerate`
+
+**Pass 2 — Trade Simulation** (no API calls — free to re-run)
+- Loads cached signals, simulates each setup forward through the full OHLCV history
+- Pessimistic fill: entry at worst end of the zone (entry_high for longs, entry_low for shorts)
+- SL checked before TP on same-candle conflicts (conservative)
+- Trailing SL to breakeven: moves SL to fill price once `trailing_sl_to_breakeven` level is touched
+- Partial target tracking: allocation closed progressively at each TP level
+- Results written to SQLite
+
+#### Features
+- **Signal modes**: `session-open` (default — first bar of each day), `every-n-bars`, `key-level-touch`
+- **Comparison table**: Claude's estimated win rate, EV, and profit factor vs actual results
+- **Breakdowns**: by trade type (scalp / intraday / swing), direction (long / short), priority (primary / secondary / conditional)
+- **Statistics**: win rate, avg R, profit factor, max drawdown (R), Sharpe (R)
+- **HTML report**: equity curve, outcome distribution chart, trade log table
+- **SQLite storage**: all signals, trades, and run metadata persisted for later querying
+- **Known limitation**: macro and news data during Pass 1 reflects current state, not historical — flagged in each signal record
+
+#### Usage
+
+```bash
+# Interactive — prompts for ticker, interval, date range
+python -m p3_backtester
+
+# Direct
+python -m p3_backtester AAPL --interval 1d --start 2024-01-01 --end 2024-12-31 --report
+python -m p3_backtester BTC --interval 1h --start 2025-01-01 --end 2025-06-30 --signal-mode every-n-bars --every-n 24
+
+# Re-run simulation without new API calls (uses existing cache)
+python -m p3_backtester AAPL --interval 1d --start 2024-01-01 --end 2024-12-31 --simulate-only --report
+
+# Force re-generation of all signals (re-runs Pass 1)
+python -m p3_backtester AAPL --interval 1d --start 2024-01-01 --end 2024-12-31 --force-regenerate
+
+# List cached runs
+python -m p3_backtester --list-runs
+
+# JSON output
+python -m p3_backtester AAPL --interval 1d --start 2024-01-01 --end 2024-12-31 --json
+```
+
+#### Signal Modes
+
+| Mode | Behavior |
+|------|----------|
+| `session-open` | One signal per trading day — first bar after midnight/open |
+| `every-n-bars` | Signal every N bars (use `--every-n N`) |
+| `key-level-touch` | Signal when price crosses a rolling 20-bar S/R level |
+
+#### File Structure
+
+```
+p3_backtester/
+├── schema.py            — BacktestConfig, SignalRecord, TradeRecord, RunStats
+├── bar_slicer.py        — recompute_technical() on sliced df (zero lookahead guarantee)
+├── market_data.py       — yfinance fetch with warmup window calculation
+├── signal_scheduler.py  — determines which bar indices generate signals
+├── trade_simulator.py   — fill, SL, TP, trailing breakeven simulation
+├── pass1_signal_gen.py  — Pass 1 loop with JSON caching and progress bar
+├── pass2_simulator.py   — Pass 2 loop, no API calls
+├── aggregator.py        — statistics, SQLite persistence, equity curve, drawdown
+├── report.py            — dark-theme HTML report
+├── cli.py               — argparse + interactive prompt + rich console output
+├── cache/               — JSON signal cache (gitignored)
+└── results/             — SQLite databases + HTML reports (gitignored)
+```
+
+#### Cost
+
+Pass 1 calls Claude once per signal bar. With `session-open` mode on daily candles over a 1-year backtest (~252 trading days), that is ~252 API calls at ~$0.025–0.035 each ≈ **$6–9 total**. Pass 2 is free. The cache means you only pay for Pass 1 once per date range.
 
 ---
 

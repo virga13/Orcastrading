@@ -21,6 +21,11 @@ env/
 # Output files
 outputs/*.json
 
+# P3 Backtester
+p3_backtester/cache/*.json
+p3_backtester/results/*.db
+p3_backtester/results/*.html
+
 # IDE
 .vscode/
 .idea/
