@@ -1,8 +1,7 @@
 import os
-import json
 from datetime import datetime, timezone
 import anthropic
-from p1_analysis_engine.schema import BiasOutput
+from p1_analysis_engine.schema import BiasOutput, SetupsOutput, FullAnalysisOutput
 from p1_analysis_engine.utils.formatting import (
     format_technical,
     format_macro,
@@ -11,7 +10,7 @@ from p1_analysis_engine.utils.formatting import (
 )
 from typing import Literal
 
-SYSTEM_PROMPT = """You are a professional quantitative analyst and trading intelligence engine.
+BIAS_SYSTEM_PROMPT = """You are a professional quantitative analyst and trading intelligence engine.
 Your role is to synthesize multi-source market data — technical indicators, macroeconomic
 conditions, news sentiment, and geopolitical context — into a single structured directional
 bias for a given asset.
@@ -34,31 +33,37 @@ Rules:
   VIX is a macro sentiment indicator, not a per-trade sizing input.
 - All prices must match the currency/unit of the input data.
 - suggested_timeframe should reflect the chart interval and signal clarity:
-    intraday intervals (1m–1h) → suggested_timeframe = "intraday" or "swing_1-5d" at most.
-    daily/weekly intervals → full range applicable.
+    intraday intervals (1m–1h) -> suggested_timeframe = "intraday" or "swing_1-5d" at most.
+    daily/weekly intervals -> full range applicable.
 - primary_thesis must be 1-2 sentences maximum.
 - key_risks must contain 3-5 items."""
 
+SETUPS_RULES = """
+TRADE SETUP RULES (mandatory — violating any makes the output invalid):
+1. MINIMUM R:R: Never generate a setup with rr_ratio below 1.5.
+2. STRUCTURAL STOP LOSS: SL must be placed just beyond a named key level. Never arbitrary distances.
+3. TRAILING SL TO BREAKEVEN: Set trailing_sl_to_breakeven at TP1 price or nearest midpoint between entry and TP1.
+4. TRADE TYPE: Exactly one of: "scalp" (minutes-hours), "intraday" (within session), "swing" (days-weeks).
+5. INVALIDATION SCENARIO: Exactly one node — price/condition that collapses the entire thesis. NOT a trade setup.
+6. EV CALCULATION: EV = (win_rate x blended_reward_pts) - ((1-win_rate) x risk_pts). Must be positive.
+7. PROFIT FACTOR: (win_rate x avg_reward) / ((1-win_rate) x risk). Must be >= 1.0.
+8. PRIORITY TIERS: Exactly one setup is "primary" — highest conviction, best R:R, bias-aligned, trade it first.
+   Others are "secondary" (valid, lower conviction) or "conditional" (requires level to break first).
+   Never label the best setup as secondary.
+9. DECISION TREE: 4-6 distinct price action scenarios (rejection, breakout, consolidation, gap, etc.)
+   covering all plausible next moves including the invalidation trigger.
+10. POSITION SIZING NOTE: Reference ATR% explicitly. Warn if ATR% > 2% (reduce size 50-70%).
+    Do NOT reference VIX for sizing — VIX is macro context only.
+11. WIN RATE: Round numbers only (45%, 50%, 55%, 60%). No false precision like 57.3%.
+    Trend-following: 50-60%, counter-trend: 40-50%, breakout: 45-55%.
+12. TARGETS: Split across 2-3 levels (e.g. 50/30/20). TP1 is always the nearest key level."""
 
-def synthesize(
-    ticker: str,
-    asset_class: Literal["equity", "forex", "crypto", "commodity"],
-    technical: dict,
-    macro: dict,
-    news: list[dict],
-    geopolitical: dict,
-    model: str = "claude-sonnet-4-6",
-    extended_thinking: bool = False,
-) -> BiasOutput:
-    """
-    Assembles the full prompt from all fetcher outputs and calls Claude
-    via tool use to produce a validated BiasOutput instance.
-    """
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+COMBINED_SYSTEM_PROMPT = BIAS_SYSTEM_PROMPT + "\n" + SETUPS_RULES
 
-    # Build user prompt from formatted sections
+
+def _build_user_prompt(ticker, asset_class, technical, macro, news, geopolitical) -> str:
     interval = technical.get("interval", "1d")
-    user_prompt = f"""ASSET: {ticker} ({asset_class})
+    return f"""ASSET: {ticker} ({asset_class})
 ANALYSIS DATE: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
 CHART INTERVAL: {interval} candles — all technical indicators and key levels are computed on this timeframe.
 
@@ -77,62 +82,117 @@ CHART INTERVAL: {interval} candles — all technical indicators and key levels a
 Based on all of the above, produce a complete structured bias analysis for this asset.
 Calibrate suggested_timeframe, key_risks, and primary_thesis to match the {interval} chart resolution."""
 
-    # Derive JSON schema from BiasOutput Pydantic model
-    bias_schema = BiasOutput.model_json_schema()
 
-    # Use tool use to force structured output
-    tool_def = {
-        "name": "record_bias_output",
-        "description": "Record the complete structured bias analysis for the asset.",
-        "input_schema": bias_schema,
-    }
+def _call_with_cache(client, model, system_prompt, tool_def, tool_name, user_prompt, extended_thinking):
+    """Single API call with prompt caching on the system prompt."""
+    cached_system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+    cache_header = {"anthropic-beta": "prompt-caching-2024-07-31"}
 
     if extended_thinking:
-        # Pass 1: extended thinking — no tools (incompatible with forced tool_choice)
         thinking_response = client.messages.create(
             model=model,
             max_tokens=16000,
             thinking={"type": "enabled", "budget_tokens": 10000},
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
-        # Pass 2: structured extraction — feed thinking output back as context
         response = client.messages.create(
             model=model,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
+            max_tokens=6000,
+            system=cached_system,
             tools=[tool_def],
-            tool_choice={"type": "tool", "name": "record_bias_output"},
+            tool_choice={"type": "tool", "name": tool_name},
+            extra_headers=cache_header,
             messages=[
                 {"role": "user", "content": user_prompt},
                 {"role": "assistant", "content": thinking_response.content},
-                {"role": "user", "content": "Now record the complete analysis above using the record_bias_output tool."},
+                {"role": "user", "content": f"Now record the complete analysis above using the {tool_name} tool."},
             ],
         )
     else:
         response = client.messages.create(
             model=model,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
+            max_tokens=6000,
+            system=cached_system,
             tools=[tool_def],
-            tool_choice={"type": "tool", "name": "record_bias_output"},
+            tool_choice={"type": "tool", "name": tool_name},
+            extra_headers=cache_header,
             messages=[{"role": "user", "content": user_prompt}],
         )
 
-    # Extract tool input from response
-    tool_use_block = next(
-        (block for block in response.content if block.type == "tool_use"),
-        None,
-    )
-    if not tool_use_block:
-        raise RuntimeError("Claude did not return a tool_use block")
+    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if not tool_block:
+        raise RuntimeError(f"Claude did not return a {tool_name} tool_use block")
+    return tool_block.input
 
-    raw = tool_use_block.input
 
-    # Inject metadata that Claude shouldn't guess
+def synthesize(
+    ticker: str,
+    asset_class: Literal["equity", "forex", "crypto", "commodity"],
+    technical: dict,
+    macro: dict,
+    news: list[dict],
+    geopolitical: dict,
+    model: str = "claude-sonnet-4-6",
+    extended_thinking: bool = False,
+) -> BiasOutput:
+    """Bias-only synthesis (used when --report is not requested)."""
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    user_prompt = _build_user_prompt(ticker, asset_class, technical, macro, news, geopolitical)
+
+    tool_def = {
+        "name": "record_bias_output",
+        "description": "Record the complete structured bias analysis for the asset.",
+        "input_schema": BiasOutput.model_json_schema(),
+    }
+
+    raw = _call_with_cache(client, model, BIAS_SYSTEM_PROMPT, tool_def, "record_bias_output", user_prompt, extended_thinking)
     raw["asset"] = ticker
     raw["asset_class"] = asset_class
     raw["analysis_timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    # Validate and return typed BiasOutput
     return BiasOutput(**raw)
+
+
+def synthesize_full(
+    ticker: str,
+    asset_class: Literal["equity", "forex", "crypto", "commodity"],
+    technical: dict,
+    macro: dict,
+    news: list[dict],
+    geopolitical: dict,
+    model: str = "claude-sonnet-4-6",
+    extended_thinking: bool = False,
+) -> tuple[BiasOutput, SetupsOutput]:
+    """Combined single-call synthesis: bias + trade setups in one API call.
+    Uses prompt caching on the system prompt to minimize input token costs."""
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    user_prompt = _build_user_prompt(ticker, asset_class, technical, macro, news, geopolitical)
+    user_prompt += "\n\nAfter completing the bias analysis, also generate 2-4 trade setups and a 4-6 scenario decision tree."
+
+    tool_def = {
+        "name": "record_full_analysis",
+        "description": "Record the complete bias analysis AND trade setups for the asset in one call.",
+        "input_schema": FullAnalysisOutput.model_json_schema(),
+    }
+
+    raw = _call_with_cache(client, model, COMBINED_SYSTEM_PROMPT, tool_def, "record_full_analysis", user_prompt, extended_thinking)
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    setup_keys = {"setups", "invalidation", "decision_tree", "position_sizing_note"}
+
+    bias_raw = {k: v for k, v in raw.items() if k not in setup_keys}
+    bias_raw["asset"] = ticker
+    bias_raw["asset_class"] = asset_class
+    bias_raw["analysis_timestamp"] = now
+    bias = BiasOutput(**bias_raw)
+
+    setups = SetupsOutput(
+        asset=ticker,
+        current_price=raw["technical"]["current_price"],
+        setups=raw["setups"],
+        invalidation=raw["invalidation"],
+        decision_tree=raw["decision_tree"],
+        position_sizing_note=raw["position_sizing_note"],
+    )
+
+    return bias, setups

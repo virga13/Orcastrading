@@ -176,13 +176,25 @@ def main():
 
     extended_thinking = getattr(args, "extended_thinking", False)
     status_msg = f"[bold]Analyzing {ticker}  [{interval}]{'  (extended thinking)' if extended_thinking else ''}...[/bold]"
+
     with console.status(status_msg, spinner="dots"):
-        from p1_analysis_engine.engine import analyze
-        try:
-            bias = analyze(ticker, model=args.model, interval=interval, extended_thinking=extended_thinking)
-        except Exception as e:
-            console.print(f"[bold red]Error:[/bold red] {e}")
-            sys.exit(1)
+        if args.report:
+            # Single merged Claude call — bias + setups in one round-trip with caching
+            from p1_analysis_engine.engine import analyze_full
+            try:
+                bias, setups = analyze_full(ticker, model=args.model, interval=interval, extended_thinking=extended_thinking)
+            except Exception as e:
+                console.print(f"[bold red]Error:[/bold red] {e}")
+                sys.exit(1)
+        else:
+            # Bias-only call (cheaper — no setups needed)
+            from p1_analysis_engine.engine import analyze
+            try:
+                bias = analyze(ticker, model=args.model, interval=interval, extended_thinking=extended_thinking)
+                setups = None
+            except Exception as e:
+                console.print(f"[bold red]Error:[/bold red] {e}")
+                sys.exit(1)
 
     # Output
     if args.json:
@@ -194,10 +206,7 @@ def main():
     # HTML report
     if args.report:
         from p1_analysis_engine.utils.report import save_report
-        from p1_analysis_engine.synthesis.setup_synthesizer import generate_setups
         import webbrowser
-        with console.status("[bold]Generating trade setups...[/bold]", spinner="dots"):
-            setups = generate_setups(bias, model=args.model, interval=interval, extended_thinking=extended_thinking)
         report_path = save_report(bias, setups, args.output_dir, interval=interval)
         console.print(f"[dim]Report saved to {report_path}[/dim]")
         webbrowser.open(f"file:///{report_path}")

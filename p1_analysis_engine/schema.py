@@ -117,6 +117,37 @@ class SetupsOutput(BaseModel):
     position_sizing_note: str   # ATR-based sizing warning
 
 
+class FullAnalysisOutput(BaseModel):
+    """Combined single-call schema: bias analysis + trade setups in one Claude call.
+    Metadata fields (asset, asset_class, analysis_timestamp, current_price) are
+    injected by the engine after the call — Claude does not fill them."""
+
+    # ── Bias fields ──
+    directional_bias: Literal["bullish", "bearish", "neutral"]
+    bias_strength: Literal["weak", "moderate", "strong"]
+    confidence_score: float = Field(ge=0.0, le=1.0)
+    key_levels: list[KeyLevel]
+    nearest_support: float
+    nearest_resistance: float
+    primary_thesis: str
+    bull_case: str
+    bear_case: str
+    key_risks: list[str]
+    technical: TechnicalSnapshot
+    macro: MacroSnapshot
+    geopolitical: GeopoliticalRisk
+    recent_news: list[NewsItem]
+    confidence_breakdown: ConfidenceBreakdown
+    data_quality_flags: list[str]
+    suggested_timeframe: Literal["intraday", "swing_1-5d", "positional_1-4w", "macro_1-3m"]
+
+    # ── Setup fields ──
+    setups: list[TradingSetup]
+    invalidation: InvalidationScenario
+    decision_tree: list[DecisionTreeEntry]
+    position_sizing_note: str
+
+
 class BiasOutput(BaseModel):
     """Canonical P1 output — consumed by P2 Trading Setups Decision Tree."""
 
