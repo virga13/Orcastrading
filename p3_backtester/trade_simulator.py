@@ -6,6 +6,7 @@ Rules:
 - On same-candle SL+TP conflict: SL wins (conservative)
 - Trailing SL to breakeven: once trailing_sl_to_breakeven price is touched, SL moves to fill_price
 - Remaining allocation at SL hit is closed at SL price
+- cost_r: round-trip transaction cost subtracted from pnl_r to give net_pnl_r
 """
 import pandas as pd
 from p1_analysis_engine.schema import TradingSetup
@@ -19,6 +20,7 @@ def simulate_trade(
     df: pd.DataFrame,
     entry_timeout_bars: int,
     claude_confidence: float,
+    cost_r: float = 0.0,
 ) -> TradeRecord:
     """
     Simulate a single setup forward from signal_bar_index.
@@ -65,6 +67,8 @@ def simulate_trade(
             outcome="EXPIRED",
             pnl_pts=0.0,
             pnl_r=0.0,
+            cost_r=0.0,
+            net_pnl_r=0.0,
             claude_win_rate_est=setup.win_rate_estimate,
             claude_ev_est=setup.ev,
             claude_rr=setup.rr_ratio,
@@ -153,7 +157,8 @@ def simulate_trade(
         close_bar = len(df) - 1
         outcome = "WIN" if realized_pnl_pts > 0 else ("BREAKEVEN" if abs(realized_pnl_pts) < 1e-8 else "LOSS")
 
-    pnl_r = realized_pnl_pts / initial_risk if initial_risk > 1e-10 else 0.0
+    pnl_r     = realized_pnl_pts / initial_risk if initial_risk > 1e-10 else 0.0
+    net_pnl_r = round(pnl_r - cost_r, 4)
 
     return TradeRecord(
         signal_bar_time=signal_bar_time,
@@ -174,6 +179,8 @@ def simulate_trade(
         target_results=target_results,
         pnl_pts=round(realized_pnl_pts, 6),
         pnl_r=round(pnl_r, 4),
+        cost_r=round(cost_r, 4),
+        net_pnl_r=net_pnl_r,
         bars_held=close_bar - fill_bar_index if fill_bar_index is not None else None,
         claude_win_rate_est=setup.win_rate_estimate,
         claude_ev_est=setup.ev,

@@ -1,6 +1,6 @@
 from typing import Literal
 
-AssetClass = Literal["equity", "forex", "crypto", "commodity"]
+AssetClass = Literal["equity", "forex", "crypto", "commodity", "index"]
 
 # Common-name aliases -> canonical yfinance ticker
 # Allows users to type "SILVER", "OIL", "GOLD", "BTC", etc.
@@ -46,6 +46,19 @@ _ALIASES: dict[str, str] = {
     "EURGBP": "EURGBP=X",
     "EURJPY": "EURJPY=X",
     "GBPJPY": "GBPJPY=X",
+    # Indices
+    "US30":      "^DJI",
+    "DOW":       "^DJI",
+    "DJI":       "^DJI",
+    "NAS100":    "^NDX",
+    "NASDAQ100": "^NDX",
+    "NDX":       "^NDX",
+    "SPX":       "^GSPC",
+    "SP500":     "^GSPC",
+    "SPX500":    "^GSPC",
+    "GER40":     "^GDAXI",
+    "DAX":       "^GDAXI",
+    "DAX40":     "^GDAXI",
 }
 
 # Known commodity futures tickers (yfinance format)
@@ -70,6 +83,14 @@ _FOREX_PAIRS: set[str] = {
     "EURCHF", "AUDJPY", "CADJPY", "CHFJPY", "NZDJPY",
 }
 
+# Known index tickers
+_INDICES: dict[str, str] = {
+    "^DJI":   "Dow Jones Industrial Average",
+    "^NDX":   "NASDAQ 100",
+    "^GSPC":  "S&P 500",
+    "^GDAXI": "DAX 40",
+}
+
 # Well-known equity tickers mapped to readable names
 _EQUITY_NAMES: dict[str, str] = {
     "AAPL": "Apple", "MSFT": "Microsoft", "GOOGL": "Google",
@@ -88,6 +109,9 @@ def resolve_ticker(ticker: str) -> str:
 def classify_asset(ticker: str) -> AssetClass:
     t = resolve_ticker(ticker)
 
+    if t in _INDICES:
+        return "index"
+
     if t in _COMMODITIES:
         return "commodity"
 
@@ -103,6 +127,9 @@ def classify_asset(ticker: str) -> AssetClass:
 def get_asset_name(ticker: str) -> str:
     """Return a human-readable name for use in news searches."""
     t = resolve_ticker(ticker)
+
+    if t in _INDICES:
+        return _INDICES[t]
 
     if t in _COMMODITIES:
         return _COMMODITIES[t]

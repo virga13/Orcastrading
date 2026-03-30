@@ -12,6 +12,7 @@ from rich.console import Console
 from p1_analysis_engine.schema import TradingSetup, SetupsOutput
 from p3_backtester.schema import BacktestConfig, SignalRecord, TradeRecord
 from p3_backtester.trade_simulator import simulate_trade
+from p3_backtester.costs import round_trip_cost_r
 
 console = Console()
 CACHE_DIR = Path(__file__).parent / "cache"
@@ -21,6 +22,7 @@ def run_pass2(
     config: BacktestConfig,
     df: pd.DataFrame,
     signals: list[SignalRecord],
+    asset_class: str = "equity",
 ) -> list[TradeRecord]:
     """
     For each signal:
@@ -59,8 +61,38 @@ def run_pass2(
                 progress.advance(task)
                 continue
 
+            # Skip signals at or past the last bar (no forward bars to simulate)
+            if signal.bar_index >= len(df) - 1:
+                progress.advance(task)
+                continue
+
             for setup in setups_obj.setups:
                 try:
+                    # Compute ATR at signal bar for cost calculation
+                    signal_bar_atr = float(df["Close"].iloc[signal.bar_index]) * 0.01  # fallback
+                    try:
+                        import ta as _ta
+                        _end = min(signal.bar_index + 1, len(df))
+                        _start = max(0, _end - 20)
+                        _close = df["Close"].iloc[_start:_end]
+                        _high  = df["High"].iloc[_start:_end]
+                        _low   = df["Low"].iloc[_start:_end]
+                        if len(_close) >= 2:
+                            signal_bar_atr = float(_ta.volatility.AverageTrueRange(
+                                _high, _low, _close, window=min(14, len(_close))
+                            ).average_true_range().iloc[-1])
+                    except Exception:
+                        pass
+
+                    cost_r = round_trip_cost_r(
+                        asset_class=asset_class,
+                        interval=config.interval,
+                        atr=signal_bar_atr,
+                        initial_risk=abs(
+                            (setup.entry_high if setup.direction == "long" else setup.entry_low)
+                            - setup.stop_loss
+                        ),
+                    )
                     trade = simulate_trade(
                         setup=setup,
                         signal_bar_index=signal.bar_index,
@@ -68,6 +100,7 @@ def run_pass2(
                         df=df,
                         entry_timeout_bars=config.entry_timeout_bars,
                         claude_confidence=signal.confidence_score,
+                        cost_r=cost_r,
                     )
                     all_trades.append(trade)
                 except Exception as e:

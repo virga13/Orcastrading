@@ -7,13 +7,13 @@ import json
 import math
 from pathlib import Path
 
-from p3_backtester.schema import BacktestConfig, TradeRecord, RunStats, CategoryStats, SignalRecord
+from p3_backtester.schema import BacktestConfig, TradeRecord, RunStats, CategoryStats, SignalRecord, WalkForwardWindow
 
 RESULTS_DIR = Path(__file__).parent / "results"
 
 
 def db_path(config: BacktestConfig) -> Path:
-    safe = config.ticker.replace("=", "").replace("-", "")
+    safe = config.ticker.replace("=", "").replace("-", "").replace("^", "")
     return RESULTS_DIR / f"backtest_{safe}_{config.interval}_{config.start_date}_{config.end_date}.db"
 
 
@@ -46,6 +46,9 @@ def save_to_db(
         CREATE TABLE IF NOT EXISTS run_metadata (
             key TEXT PRIMARY KEY, value TEXT
         );
+        DELETE FROM signals;
+        DELETE FROM trades;
+        DELETE FROM run_metadata;
     """)
 
     cur.executemany(
@@ -80,6 +83,7 @@ def compute_stats(
     config: BacktestConfig,
     signals: list[SignalRecord],
     trades: list[TradeRecord],
+    strategy_name: str = "Rule Engine",
 ) -> RunStats:
     filled = [t for t in trades if t.outcome != "EXPIRED"]
     expired = [t for t in trades if t.outcome == "EXPIRED"]
@@ -119,6 +123,11 @@ def compute_stats(
     gl     = abs(sum(t.pnl_r for t in losses))
     pf     = gp / gl if gl > 0 else (999.0 if gp > 0 else 0.0)
 
+    # Net (after costs)
+    net_gp = sum(t.net_pnl_r for t in wins)
+    net_gl = abs(sum(t.net_pnl_r for t in losses))
+    net_pf = net_gp / net_gl if net_gl > 0 else (999.0 if net_gp > 0 else 0.0)
+
     # Sharpe on R-multiples
     if len(filled) > 1:
         mean_r = sum(t.pnl_r for t in filled) / len(filled)
@@ -145,12 +154,16 @@ def compute_stats(
         for p in ("primary", "secondary", "conditional")
     }
 
-    return RunStats(
+    from p3_backtester.walk_forward import kelly_from_stats
+    avg_net_pnl_r = round(sum(t.net_pnl_r for t in filled) / len(filled), 4) if filled else 0.0
+
+    stats = RunStats(
         ticker=config.ticker,
         interval=config.interval,
         start_date=config.start_date,
         end_date=config.end_date,
         signal_mode=config.signal_mode,
+        strategy_name=strategy_name,
         total_signals=len(signals),
         total_setups_generated=sum(s.n_setups for s in signals),
         total_trades_filled=len(filled),
@@ -158,6 +171,8 @@ def compute_stats(
         actual_win_rate=round(len(wins) / len(filled), 4) if filled else 0.0,
         actual_avg_pnl_r=round(sum(t.pnl_r for t in filled) / len(filled), 4) if filled else 0.0,
         actual_profit_factor=round(pf, 3),
+        actual_avg_net_pnl_r=avg_net_pnl_r,
+        actual_net_profit_factor=round(net_pf, 3),
         max_drawdown_r=round(drawdown, 4),
         sharpe_r=round(sharpe, 4),
         avg_claude_win_rate=round(sum(t.claude_win_rate_est for t in filled) / len(filled), 4) if filled else 0.0,
@@ -166,6 +181,8 @@ def compute_stats(
         by_direction=by_dir,
         by_priority=by_pri,
     )
+    stats.kelly_25pct = kelly_from_stats(stats, 0.25)
+    return stats
 
 
 def compute_equity_curve(filled_trades: list[TradeRecord]) -> list[float]:

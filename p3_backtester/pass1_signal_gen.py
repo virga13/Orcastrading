@@ -16,8 +16,9 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRe
 from rich.console import Console
 
 from p3_backtester.bar_slicer import recompute_technical
-from p3_backtester.rule_engine import generate_setups_from_technicals
 from p3_backtester.schema import BacktestConfig, SignalRecord
+from p3_backtester.strategies.base import StrategyBase
+from p3_backtester.strategies.rule_engine_strategy import RuleEngineStrategy
 
 console = Console()
 
@@ -26,7 +27,7 @@ CACHE_DIR = Path(__file__).parent / "cache"
 
 def _cache_path(ticker: str, interval: str, bar_time: pd.Timestamp, use_claude: bool) -> Path:
     unix_ms = int(bar_time.timestamp() * 1000)
-    safe    = ticker.replace("=", "").replace("-", "")
+    safe    = ticker.replace("=", "").replace("-", "").replace("^", "")
     suffix  = "_claude" if use_claude else ""
     return CACHE_DIR / f"{safe}_{interval}_{unix_ms}{suffix}.json"
 
@@ -36,6 +37,7 @@ def run_pass1(
     df: pd.DataFrame,
     signal_indices: list[int],
     use_claude: bool = False,
+    strategy: StrategyBase | None = None,
 ) -> list[SignalRecord]:
     """
     For each signal bar index:
@@ -51,6 +53,12 @@ def run_pass1(
 
     ticker   = config.ticker
     interval = config.interval
+
+    # Default strategy: rule engine (backwards compatible)
+    if strategy is None:
+        strategy = RuleEngineStrategy()
+
+    mode_label = "[bold cyan]Claude[/bold cyan]" if use_claude else f"[bold green]{strategy.name}[/bold green]"
 
     # Claude-mode: fetch macro/news/geo once (current state — not historical)
     macro = geo = news = None
@@ -77,7 +85,6 @@ def run_pass1(
         except Exception:
             geo = _empty_geo()
 
-    mode_label = "[bold cyan]Claude[/bold cyan]" if use_claude else "[bold green]rule engine[/bold green]"
     signals: list[SignalRecord] = []
     skipped = 0
 
@@ -134,17 +141,17 @@ def run_pass1(
                 time.sleep(0.3)   # Anthropic rate limiting
             else:
                 technical["ticker"] = ticker
-                setups_obj = generate_setups_from_technicals(technical)
+                df_slice = df.iloc[: i + 1].copy()
+                setups_obj = strategy.generate_setups(technical, df_slice)
                 if setups_obj is None:
                     progress.advance(task)
                     continue
-                # Derive bias from rule engine's primary setup
                 primary = next((s for s in setups_obj.setups if s.priority == "primary"), None)
                 directional_bias = primary.direction if primary else "neutral"
                 bias_strength    = "moderate"
                 confidence       = primary.confidence if primary else 0.5
                 setups_dump      = setups_obj.model_dump()
-                flags            = ["rule_engine"]
+                flags            = [strategy.name.lower().replace(" ", "_")]
 
             signal_meta = SignalRecord(
                 bar_index=i,
@@ -165,6 +172,19 @@ def run_pass1(
             cache_file.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
             signals.append(signal_meta)
             progress.advance(task)
+
+    # ── ADX percentile filter ─────────────────────────────────────────────────
+    # Keep only the top N% of signals by confidence_score (proxy for ADX).
+    # This reduces trade count but improves average quality.
+    if config.top_adx_pct < 1.0 and signals:
+        signals.sort(key=lambda s: s.confidence_score, reverse=True)
+        keep_n = max(1, int(len(signals) * config.top_adx_pct))
+        before = len(signals)
+        signals = sorted(signals[:keep_n], key=lambda s: s.bar_index)
+        console.print(
+            f"  [dim]ADX filter (top {config.top_adx_pct:.0%}): "
+            f"{before} -> {len(signals)} signals[/dim]"
+        )
 
     console.print(f"  [dim]Pass 1 complete: {len(signals)} signals ({skipped} from cache)[/dim]")
     return signals

@@ -12,6 +12,7 @@ class BacktestConfig(BaseModel):
     entry_timeout_bars: int = 20   # bars to wait for price to enter entry zone
     model: str = "claude-sonnet-4-6"
     force_regenerate: bool = False # re-run Pass 1 even if cache exists
+    top_adx_pct: float = 1.0      # keep only top N% of signals by ADX (1.0 = keep all)
 
 
 class SignalRecord(BaseModel):
@@ -65,6 +66,10 @@ class TradeRecord(BaseModel):
     claude_rr: float
     claude_confidence: float
 
+    # Transaction costs
+    cost_r: float = 0.0                     # round-trip spread+slippage in R-multiples
+    net_pnl_r: float = 0.0                  # pnl_r - cost_r (what you actually keep)
+
 
 class CategoryStats(BaseModel):
     n_trades: int
@@ -79,12 +84,28 @@ class CategoryStats(BaseModel):
     avg_claude_ev: float
 
 
+class WalkForwardWindow(BaseModel):
+    name: str                       # "train" | "validation" | "test"
+    start_date: str
+    end_date: str
+    n_fills: int
+    win_rate: float
+    avg_pnl_r: float
+    avg_net_pnl_r: float            # after costs
+    profit_factor: float
+    net_profit_factor: float        # after costs
+    max_drawdown_r: float
+    sharpe_r: float
+    kelly_25pct: float              # 25% Kelly fraction
+
+
 class RunStats(BaseModel):
     ticker: str
     interval: str
     start_date: str
     end_date: str
     signal_mode: str
+    strategy_name: str = "Rule Engine"
 
     total_signals: int
     total_setups_generated: int
@@ -94,6 +115,8 @@ class RunStats(BaseModel):
     actual_win_rate: float
     actual_avg_pnl_r: float
     actual_profit_factor: float
+    actual_avg_net_pnl_r: float = 0.0    # after costs
+    actual_net_profit_factor: float = 0.0
     max_drawdown_r: float
     sharpe_r: float
 
@@ -103,3 +126,6 @@ class RunStats(BaseModel):
     by_trade_type: dict[str, CategoryStats]
     by_direction: dict[str, CategoryStats]
     by_priority: dict[str, CategoryStats]
+
+    walk_forward: list[WalkForwardWindow] = []
+    kelly_25pct: float = 0.0

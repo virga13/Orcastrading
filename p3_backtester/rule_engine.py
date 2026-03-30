@@ -57,7 +57,7 @@ def _interval_to_trade_type(interval: str) -> str:
 
 # ── Signal quality gate ───────────────────────────────────────────────────────
 
-def _assess_bias(tech: dict) -> tuple[str, float]:
+def _assess_bias(tech: dict, interval: str = "1d") -> tuple[str, float]:
     """
     Returns (bias, confidence) from technical indicators.
     bias = "long" | "short" | "none"
@@ -65,6 +65,11 @@ def _assess_bias(tech: dict) -> tuple[str, float]:
 
     Requires alignment across trend, MACD, EMA, and RSI.
     Returns "none" when signals conflict — no setup generated.
+
+    ADX threshold is interval-aware: shorter timeframes (5m/15m) are
+    noisier so we accept a lower ADX floor to generate enough signals.
+    Short bias requires stronger confirmation than long bias to reduce
+    false counter-trend shorts in trending markets.
     """
     trend   = tech["trend"]
     macd    = tech["macd_signal"]
@@ -98,17 +103,20 @@ def _assess_bias(tech: dict) -> tuple[str, float]:
     if short_score > long_score and rsi < 30:
         return "none", 0.0
 
-    # ADX gate — require trend strength; weak-trend bars heavily penalised
-    adx_multiplier = 1.0 if adx >= 20 else 0.5
+    # Interval-aware ADX gate — 5m/15m are noisier, use lower floor
+    adx_threshold = 15 if interval in ("1m", "5m", "15m") else 20
+    adx_multiplier = 1.0 if adx >= adx_threshold else 0.5
 
     net = (long_score - short_score) * adx_multiplier
 
-    # Raise bar: net >= 3.0 ensures ADX >= 20 AND strong multi-indicator alignment
+    # Long threshold: 3.0 (unchanged)
+    # Short threshold: 3.5 — require stronger confirmation to reduce
+    # false counter-trend shorts in trending/volatile markets
     if net >= 3.0:
         confidence = min(0.42 + (net - 3.0) * 0.06, 0.75)
         return "long", round(confidence, 2)
-    if net <= -3.0:
-        confidence = min(0.42 + (abs(net) - 3.0) * 0.06, 0.75)
+    if net <= -3.5:
+        confidence = min(0.42 + (abs(net) - 3.5) * 0.06, 0.75)
         return "short", round(confidence, 2)
 
     return "none", 0.0
@@ -131,7 +139,7 @@ def generate_setups_from_technicals(tech: dict) -> SetupsOutput | None:
     vol      = tech["volume_trend"]
     trade_type = _interval_to_trade_type(interval)
 
-    bias, confidence = _assess_bias(tech)
+    bias, confidence = _assess_bias(tech, interval)
 
     # No setup if signals conflict
     if bias == "none":
@@ -144,12 +152,10 @@ def generate_setups_from_technicals(tech: dict) -> SetupsOutput | None:
     if setup_a:
         setups.append(setup_a)
 
-    # ── Setup B — Counter-trend bounce (only when very close to level) ────────
-    # Tighter proximity gate (0.15 ATR) to reduce false counter-trend signals
-    if abs(price - (support if bias == "short" else resist)) <= atr * 0.15:
-        setup_b = _build_level_bounce(price, atr, support, resist, bias, trade_type, interval, tech)
-        if setup_b:
-            setups.append(setup_b)
+    # Setup B (counter-trend bounce) excluded:
+    # Backtest evidence shows secondary/counter-trend setups consistently lose
+    # across all tested assets (WR 0-20%, avg R -0.59 to -1.00). The edge
+    # does not justify the drawdown — only trend-following setups are generated.
 
     # Setup C (breakout) intentionally excluded:
     # On daily bars the simulator fills on intrabar touches above resistance,

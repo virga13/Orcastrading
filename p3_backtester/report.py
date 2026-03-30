@@ -45,18 +45,19 @@ def _generate_html(stats: RunStats, trades: list[TradeRecord]) -> str:
     trade_rows = ""
     for t in sorted(filled, key=lambda x: x.signal_bar_time):
         oc = _outcome_color(t.outcome)
-        pnl_col = "var(--bull)" if t.pnl_r > 0 else ("var(--bear)" if t.pnl_r < 0 else "var(--gold)")
+        pnl_col     = "var(--bull)" if t.pnl_r > 0 else ("var(--bear)" if t.pnl_r < 0 else "var(--gold)")
+        net_pnl_col = "var(--bull)" if t.net_pnl_r > 0 else ("var(--bear)" if t.net_pnl_r < 0 else "var(--gold)")
         trade_rows += f"""
         <tr>
           <td>{t.signal_bar_time[:16]}</td>
           <td>{t.setup_name}</td>
           <td style="color:{'var(--bull)' if t.direction=='long' else 'var(--bear)'}">{t.direction.upper()}</td>
           <td>{t.trade_type}</td>
-          <td>{t.priority}</td>
           <td style="font-family:monospace">{f'{t.fill_price:,.4f}' if t.fill_price is not None else 'N/A'}</td>
           <td style="color:{oc};font-weight:600">{t.outcome}</td>
           <td style="color:{pnl_col};font-family:monospace">{t.pnl_r:+.2f}R</td>
-          <td style="font-family:monospace">{t.claude_win_rate_est:.0%}</td>
+          <td style="color:var(--muted);font-family:monospace">-{t.cost_r:.3f}R</td>
+          <td style="color:{net_pnl_col};font-family:monospace;font-weight:600">{t.net_pnl_r:+.2f}R</td>
           <td>{t.bars_held or '—'}</td>
         </tr>"""
 
@@ -65,6 +66,26 @@ def _generate_html(stats: RunStats, trades: list[TradeRecord]) -> str:
     wr_color   = "#00d4aa" if wr_delta >= 0 else "#ff4d6d"
     ev_color   = "#00d4aa" if ev_delta >= 0 else "#ff4d6d"
     gen_ts     = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    net_pf_color = "#00d4aa" if stats.actual_net_profit_factor >= 1.0 else "#ff4d6d"
+
+    # Walk-forward section
+    wf_rows = ""
+    if stats.walk_forward:
+        for w in stats.walk_forward:
+            is_test = w.name == "test"
+            style   = "font-weight:700" if is_test else ""
+            rc      = "#00d4aa" if w.avg_net_pnl_r > 0 else "#ff4d6d"
+            pfc     = "#00d4aa" if w.net_profit_factor >= 1.0 else "#ff4d6d"
+            wf_rows += f"""
+            <tr style="{style}">
+              <td>{w.name.upper()}</td>
+              <td>{w.start_date} &rarr; {w.end_date}</td>
+              <td style="text-align:right">{w.n_fills}</td>
+              <td style="text-align:right">{w.win_rate:.1%}</td>
+              <td style="text-align:right;color:{rc}">{w.avg_net_pnl_r:+.3f}R</td>
+              <td style="text-align:right;color:{pfc}">{w.net_profit_factor:.2f}x</td>
+              <td style="text-align:right;color:var(--muted)">{w.kelly_25pct*100:.1f}%</td>
+            </tr>"""
 
     # Category rows for by_trade_type
     type_rows = ""
@@ -150,8 +171,8 @@ def _generate_html(stats: RunStats, trades: list[TradeRecord]) -> str:
     </div>
     <div class="stat-card">
       <div class="stat-val" style="color:{'var(--bull)' if stats.actual_profit_factor>=1 else 'var(--bear)'}">{stats.actual_profit_factor:.2f}x</div>
-      <div class="stat-label">Profit Factor</div>
-      <div style="font-size:11px;color:var(--muted);margin-top:6px">Max DD: <span style="color:var(--bear)">-{stats.max_drawdown_r:.2f}R</span></div>
+      <div class="stat-label">Profit Factor (Gross)</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:6px">Net PF: <span style="color:{net_pf_color}">{stats.actual_net_profit_factor:.2f}x</span> &middot; MaxDD: <span style="color:var(--bear)">-{stats.max_drawdown_r:.2f}R</span></div>
     </div>
     <div class="stat-card">
       <div class="stat-val">{stats.total_trades_filled}</div>
@@ -185,14 +206,17 @@ def _generate_html(stats: RunStats, trades: list[TradeRecord]) -> str:
     </table>
   </div>
 
+  <!-- WALK-FORWARD -->
+  {'<div class="card"><div class="card-title">Walk-Forward Validation (Train 60% / Val 20% / Test 20%)</div><div style="overflow-x:auto"><table><thead><tr><th>Window</th><th>Period</th><th style="text-align:right">Fills</th><th style="text-align:right">Win %</th><th style="text-align:right">Net Avg R</th><th style="text-align:right">Net PF</th><th style="text-align:right">Kelly 25%</th></tr></thead><tbody>' + wf_rows + '</tbody></table></div><p style="font-size:11px;color:var(--muted);margin-top:12px">TEST window is held-out — never used during optimization. This is the honest performance estimate.</p></div>' if wf_rows else ''}
+
   <!-- TRADE LOG -->
   <div class="card">
-    <div class="card-title">Trade Log ({len(filled)} filled trades)</div>
+    <div class="card-title">Trade Log ({len(filled)} filled trades) — Strategy: {stats.strategy_name}</div>
     <div style="overflow-x:auto">
       <table>
         <thead><tr>
-          <th>Signal Time</th><th>Setup</th><th>Dir</th><th>Type</th><th>Priority</th>
-          <th>Fill</th><th>Outcome</th><th>PnL (R)</th><th>Claude WR</th><th>Bars</th>
+          <th>Signal Time</th><th>Setup</th><th>Dir</th><th>Type</th>
+          <th>Fill</th><th>Outcome</th><th>Gross R</th><th>Cost</th><th>Net R</th><th>Bars</th>
         </tr></thead>
         <tbody>{trade_rows}</tbody>
       </table>
