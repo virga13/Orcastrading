@@ -44,8 +44,8 @@ _BARS_PER_DAY: dict[str, float] = {
     "15m": 26,
     "30m": 13,
     "1h":  6.5,
-    "1d":  1,
-    "1wk": 0.2,
+    "1d":  0.69,   # ~252 trading days / 365 calendar days
+    "1wk": 0.14,   # ~52 weeks / 365 calendar days
 }
 
 # ── Stooq ticker mapping ──────────────────────────────────────────────────────
@@ -123,6 +123,11 @@ def fetch_ohlcv(
 
     if source == "auto":
         sources = _auto_source_order(ticker, interval, is_crypto)
+    elif source == "eodhd":
+        # Delegate directly to core.data EODHD provider
+        from core.data import _fetch_eodhd
+        df = _fetch_eodhd(ticker, interval, fetch_start, fetch_end)
+        return _normalise(df)
     else:
         sources = [source]
 

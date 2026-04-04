@@ -16,11 +16,36 @@ Timeframe pairs (auto-derived from entry interval):
 
 All HTF computation resamples from the already-sliced df (df.iloc[:i+1]),
 so there is zero lookahead bias.
+
+Gates (all must pass):
+  1. HTF EMA20 > EMA50 = long bias, EMA20 < EMA50 = short bias
+  2. HTF ADX >= adx_threshold (longs) or adx_threshold_short (shorts)
+  3. ETF price within pullback_max_atr of EMA20 (retest arrived)
+  4. Prior distance: price was >= min_prior_distance_atr away from EMA20 IN THE
+     DIRECTION OF THE TRADE in the last N bars (confirms genuine pullback, not
+     price bouncing against the EMA from the wrong side)
+  5. RSI filter: <= rsi_max for longs, >= rsi_min for shorts
+  6. Regime filter: SMA200-based — no longs in bear_trend, no shorts in bull_trend
+
+Changes from v1
+---------------
+- Gate 4 fix: abs() replaced with directional check — long signals require price
+  to have been ABOVE EMA20 (not just "away from it"), preventing bounce signals
+  in declining price action from masquerading as pullback entries.
+- Gate 2 asymmetry: shorts use adx_threshold_short (default 15) vs longs at 20.
+  Bear markets form with lower ADX initially; 20 was too strict and suppressed
+  early short entries entirely.
+- Gate 6 (new): SMA200 regime filter. Blocks longs when price is in a confirmed
+  bear regime and blocks shorts in a confirmed bull regime. This is the primary
+  fix for 2022-style catastrophic drawdowns where the strategy kept buying into
+  a declining market.
+- Confidence score updated to incorporate regime alignment.
 """
 import ta
 import pandas as pd
 
 from p3_backtester.strategies.base import StrategyBase
+from p3_backtester.strategies.regime_filter import classify_regime
 from p1_analysis_engine.schema import (
     TradingSetup, SetupTarget, InvalidationScenario,
     DecisionTreeEntry, SetupsOutput,
@@ -94,11 +119,12 @@ class MTFTrendStrategy(StrategyBase):
 
     Gates (all must pass):
       1. HTF EMA20 > EMA50 = long bias, EMA20 < EMA50 = short bias
-      2. HTF ADX >= adx_threshold (trending, not ranging)
+      2. HTF ADX >= adx_threshold (longs) / adx_threshold_short (shorts)
       3. ETF price within pullback_max_atr of EMA20 (retest arrived)
-      4. Prior distance: price was >= min_prior_distance_atr away in last N bars
-         (confirms genuine pullback, not price that hugs the EMA)
+      4. Prior distance (directional): price was >= min_prior_distance_atr ABOVE
+         EMA20 for longs (BELOW for shorts) in the last N bars — genuine pullback
       5. RSI filter: <= rsi_max for longs, >= rsi_min for shorts
+      6. Regime filter: no longs in bear_trend, no shorts in bull_trend (SMA200)
 
     Entry zone: [EMA20 - 0.3*ATR, EMA20 + 0.2*ATR] for longs (mirror for shorts)
     Stop: structural swing low/high - sl_buffer_atr * ATR
@@ -106,13 +132,14 @@ class MTFTrendStrategy(StrategyBase):
     """
 
     name = "MTF Trend"
-    description = "Multi-timeframe: HTF EMA20/50 bias + ETF EMA20 retest entry, structural SL"
+    description = "Multi-timeframe: HTF EMA20/50 bias + ETF EMA20 retest entry, structural SL, SMA200 regime filter"
 
     def __init__(
         self,
         ema_fast: int = 20,
         ema_slow: int = 50,
         adx_threshold: int = 20,
+        adx_threshold_short: int = 15,
         pullback_max_atr: float = 1.2,
         min_prior_distance_atr: float = 1.5,
         prior_lookback: int = 5,
@@ -125,10 +152,13 @@ class MTFTrendStrategy(StrategyBase):
         tp1_alloc: int = 70,
         tp2_alloc: int = 30,
         win_rate: float = 0.48,
+        regime_filter: bool = True,
+        shorts_enabled: bool = True,
     ):
         self.ema_fast               = ema_fast
         self.ema_slow               = ema_slow
         self.adx_threshold          = adx_threshold
+        self.adx_threshold_short    = adx_threshold_short
         self.pullback_max_atr       = pullback_max_atr
         self.min_prior_distance_atr = min_prior_distance_atr
         self.prior_lookback         = prior_lookback
@@ -141,15 +171,20 @@ class MTFTrendStrategy(StrategyBase):
         self.tp1_alloc              = tp1_alloc
         self.tp2_alloc              = tp2_alloc
         self.win_rate               = win_rate
+        self.regime_filter          = regime_filter
+        self.shorts_enabled         = shorts_enabled
 
     @property
     def params(self) -> dict:
         return {
-            "ema_fast":      self.ema_fast,
-            "ema_slow":      self.ema_slow,
-            "adx_threshold": self.adx_threshold,
-            "tp1_r":         self.tp1_r,
-            "rsi_max":       self.rsi_max,
+            "ema_fast":            self.ema_fast,
+            "ema_slow":            self.ema_slow,
+            "adx_threshold":       self.adx_threshold,
+            "adx_threshold_short": self.adx_threshold_short,
+            "tp1_r":               self.tp1_r,
+            "rsi_max":             self.rsi_max,
+            "regime_filter":       self.regime_filter,
+            "shorts_enabled":      self.shorts_enabled,
         }
 
     def _htf_bias(
@@ -214,8 +249,26 @@ class MTFTrendStrategy(StrategyBase):
         htf_bias, htf_adx, htf_ema_f, htf_ema_s = self._htf_bias(df, interval)
         if htf_bias is None:
             return None
-        if htf_adx < self.adx_threshold:
+
+        # Directional gate: suppress shorts when running long-only
+        if not self.shorts_enabled and htf_bias == "short":
             return None
+
+        # Asymmetric ADX threshold: shorts require less trend strength to fire
+        # (bear markets often start with lower ADX as the trend is forming)
+        adx_min = self.adx_threshold if htf_bias == "long" else self.adx_threshold_short
+        if htf_adx < adx_min:
+            return None
+
+        # ── Gate 6: Regime filter (SMA200) ───────────────────────────────────
+        # Applied before computing ETF indicators to fail fast.
+        regime = "neutral"
+        if self.regime_filter:
+            regime = classify_regime(df, interval)
+            if regime == "bear_trend" and htf_bias == "long":
+                return None   # never buy into a confirmed bear market
+            if regime == "bull_trend" and htf_bias == "short":
+                return None   # never short a confirmed bull market
 
         # ── Gate 3: ETF EMA20 proximity ───────────────────────────────────────
         close = df["Close"]
@@ -234,23 +287,37 @@ class MTFTrendStrategy(StrategyBase):
         if abs(dist_atr) > self.pullback_max_atr:
             return None
 
-        # Must be on the correct side — long bias needs price at or slightly above EMA
-        # (allow up to 0.5 ATR below EMA — slight undershoot is fine)
-        if htf_bias == "long"  and dist_pts < -0.5 * atr:
+        # Must be on the correct side — long bias needs price at or slightly above EMA.
+        # Allow up to 0.8 ATR overshoot: volatile assets and lower timeframes (1h, 15m)
+        # frequently undershoot the EMA before bouncing. 0.5 was too tight and cut
+        # valid entries on crypto and gold 1h setups.
+        if htf_bias == "long"  and dist_pts < -0.8 * atr:
             return None
-        if htf_bias == "short" and dist_pts >  0.5 * atr:
+        if htf_bias == "short" and dist_pts >  0.8 * atr:
             return None
 
-        # ── Gate 4: Prior distance — confirm genuine pullback ─────────────────
+        # ── Gate 4: Prior distance — directional (v1 bug fix) ────────────────
+        # Long:  price must have been ABOVE EMA20 by min_prior_distance_atr in
+        #        the last N bars. This confirms we're entering a genuine pullback
+        #        from above, not a bounce attempt against overhead resistance.
+        # Short: price must have been BELOW EMA20 by min_prior_distance_atr —
+        #        confirms the rally that is now fading was real.
         prior_valid = False
         for j in range(2, self.prior_lookback + 2):
             if len(etf_ema_s) < j or len(close) < j:
                 break
             p_ema   = float(etf_ema_s.iloc[-j])
             p_price = float(close.iloc[-j])
-            if abs(p_price - p_ema) >= atr * self.min_prior_distance_atr:
-                prior_valid = True
-                break
+            if htf_bias == "long":
+                # Prior bar was clearly ABOVE EMA (directional, not abs)
+                if p_price - p_ema >= atr * self.min_prior_distance_atr:
+                    prior_valid = True
+                    break
+            else:
+                # Prior bar was clearly BELOW EMA
+                if p_ema - p_price >= atr * self.min_prior_distance_atr:
+                    prior_valid = True
+                    break
         if not prior_valid:
             return None
 
@@ -292,14 +359,29 @@ class MTFTrendStrategy(StrategyBase):
             tp1 = round(fill_ref - self.tp1_r * risk_ref, 4)
             tp2 = round(fill_ref - self.tp2_r * risk_ref, 4)
 
-        avg_r    = self.tp1_r * (self.tp1_alloc / 100) + self.tp2_r * (self.tp2_alloc / 100)
-        ev       = round((self.win_rate * avg_r) - ((1 - self.win_rate) * 1.0), 4)
-        pf_val   = round((self.win_rate * avg_r) / max(1 - self.win_rate, 1e-10), 3)
-        conf     = min(0.38 + (htf_adx - self.adx_threshold) * 0.007, 0.75)
+        avg_r  = self.tp1_r * (self.tp1_alloc / 100) + self.tp2_r * (self.tp2_alloc / 100)
+        ev     = round((self.win_rate * avg_r) - ((1 - self.win_rate) * 1.0), 4)
+        pf_val = round((self.win_rate * avg_r) / max(1 - self.win_rate, 1e-10), 3)
+
+        # Confidence score: baseline from ADX strength, boosted when regime aligns
+        regime_boost = {"bull_trend": 0.05, "neutral": 0.0, "bear_trend": 0.05}
+        # In bear_trend we only reach here on short signals — same boost applies
+        conf = min(
+            0.38
+            + (htf_adx - adx_min) * 0.007
+            + regime_boost.get(regime, 0.0),
+            0.80,
+        )
 
         rule      = _HTF_RESAMPLE.get(interval, "1D")
         htf_label = _HTF_LABEL.get(rule, rule)
         trade_type = _interval_trade_type(interval)
+
+        regime_note = {
+            "bull_trend": "Regime: BULL (SMA200 confirmed).",
+            "bear_trend": "Regime: BEAR (SMA200 confirmed).",
+            "neutral":    "Regime: NEUTRAL (transitioning).",
+        }.get(regime, "")
 
         setup = TradingSetup(
             name="Setup A",
@@ -312,11 +394,14 @@ class MTFTrendStrategy(StrategyBase):
             status="PRIMARY WATCH",
             priority="primary",
             rationale=(
-                f"HTF ({htf_label}) EMA{self.ema_fast}({htf_ema_f:,.2f}) > EMA{self.ema_slow}({htf_ema_s:,.2f}) "
+                f"HTF ({htf_label}) EMA{self.ema_fast}({htf_ema_f:,.2f}) "
+                f"{'>' if htf_bias=='long' else '<'} "
+                f"EMA{self.ema_slow}({htf_ema_s:,.2f}) "
                 f"-> {htf_bias} bias (ADX {htf_adx:.0f}). "
                 f"Price retesting ETF EMA{self.ema_fast} at {etf_ema_val:,.4f} ({dist_atr:+.2f} ATR). "
                 f"RSI {rsi:.0f} confirms momentum. "
-                f"Structural SL at swing {'low' if htf_bias == 'long' else 'high'} {swing:,.4f}."
+                f"Structural SL at swing {'low' if htf_bias == 'long' else 'high'} {swing:,.4f}. "
+                f"{regime_note}"
             ),
             trigger=(
                 f"Price enters EMA{self.ema_fast} retest zone "
@@ -346,7 +431,8 @@ class MTFTrendStrategy(StrategyBase):
             confidence=round(conf, 2),
             confidence_note=(
                 f"HTF EMA{self.ema_fast}={htf_ema_f:,.2f} | HTF ADX {htf_adx:.0f} "
-                f"| ETF dist {dist_atr:+.2f}ATR | RSI {rsi:.0f} | SL={sl:,.4f}"
+                f"| ETF dist {dist_atr:+.2f}ATR | RSI {rsi:.0f} | SL={sl:,.4f} "
+                f"| {regime_note}"
             ),
         )
 

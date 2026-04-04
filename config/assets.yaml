@@ -1,0 +1,137 @@
+# Orcastrading — Central Asset Registry
+#
+# Add new assets here. Each module (P1, P3, P4) reads from this file via core.config.
+#
+# ticker sources:
+#   yfinance : symbol used with yfinance / stooq
+#   eodhd    : symbol used with EODHD API  (format: SYMBOL.EXCHANGE)
+#   ccxt     : symbol used with CCXT/Binance (format: BASE/QUOTE)
+#
+# session times are in exchange-local time (tz-naive, same as yfinance returns).
+# GMT+2 equivalents shown in comments for reference.
+#
+# strategies: list of strategy IDs enabled for this asset.
+#   Add/remove here to change what gets scanned for each asset.
+
+assets:
+
+  - id: spx500
+    label: SPX500
+    tickers:
+      yfinance: "^GSPC"
+      eodhd: "GSPC.INDX"
+      stooq: "^SPX"
+    category: index
+    currency: USD
+    session:
+      open: "09:30"          # ET  (= 16:30 GMT+2)
+      close: "16:00"         # ET  (= 23:00 GMT+2)
+      timezone: "America/New_York"
+    orb:
+      opening_range_start: "09:30"   # ET
+      opening_range_end:   "10:00"   # ET  (30-min range)
+      trade_window_end:    "11:00"   # ET  (= 18:00 GMT+2)
+    strategies:
+      - mtf_trend
+      - orb
+      - ema_continuation
+
+  - id: us30
+    label: US30
+    tickers:
+      yfinance: "^DJI"
+      eodhd: "DJI.INDX"
+      stooq: "^DJI"
+    category: index
+    currency: USD
+    session:
+      open: "09:30"
+      close: "16:00"
+      timezone: "America/New_York"
+    orb:
+      opening_range_start: "09:30"
+      opening_range_end:   "10:00"
+      trade_window_end:    "11:00"
+    strategies:
+      - mtf_trend
+      - orb
+      - ema_continuation
+
+  - id: bitcoin
+    label: Bitcoin
+    tickers:
+      yfinance: "BTC-USD"
+      ccxt: "BTC/USDT"
+    category: crypto
+    currency: USD
+    session:
+      open: "00:00"
+      close: "23:59"
+      timezone: "UTC"
+    strategies:
+      - mtf_trend
+      - momentum_breakout
+      - ema_pullback
+
+  - id: gold
+    label: Gold
+    tickers:
+      yfinance: "GC=F"
+      eodhd: "GC.COMM"
+      stooq: "GC.F"
+    category: commodity
+    currency: USD
+    session:
+      open: "09:30"
+      close: "17:00"
+      timezone: "America/New_York"
+    orb:
+      opening_range_start: "09:30"
+      opening_range_end:   "10:00"
+      trade_window_end:    "11:00"
+    strategies:
+      - mtf_trend
+      - orb
+      - ema_pullback
+
+  - id: silver
+    label: Silver
+    tickers:
+      yfinance: "SI=F"
+      eodhd: "SI.COMM"
+      stooq: "SI.F"
+    category: commodity
+    currency: USD
+    session:
+      open: "09:30"
+      close: "17:00"
+      timezone: "America/New_York"
+    orb:
+      opening_range_start: "09:30"
+      opening_range_end:   "10:00"
+      trade_window_end:    "11:00"
+    strategies:
+      - mtf_trend
+      - orb
+      - ema_pullback
+
+  - id: ger40
+    label: GER40
+    tickers:
+      yfinance: "^GDAXI"
+      eodhd: "GDAXI.INDX"
+      stooq: "^DAX"
+    category: index
+    currency: EUR
+    session:
+      open: "09:00"          # CET/CEST  (= 10:00/11:00 GMT+2 depending on DST)
+      close: "17:30"
+      timezone: "Europe/Berlin"
+    orb:
+      opening_range_start: "09:00"   # CET
+      opening_range_end:   "09:30"   # CET  (30-min range)
+      trade_window_end:    "11:00"   # CET
+    strategies:
+      - mtf_trend
+      - orb
+      - ema_continuation

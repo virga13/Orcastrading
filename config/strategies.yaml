@@ -1,0 +1,198 @@
+# Orcastrading — Strategy Parameter Defaults
+#
+# These are the default parameters used when a strategy is instantiated without
+# explicit overrides. Override per-asset in assets.yaml or via the UI/CLI.
+#
+# class: importable path to the strategy class
+# timeframe: interval this strategy uses for its primary data feed
+# lookback_days: calendar days of history needed for warmup
+
+strategies:
+
+  mtf_trend:
+    name: "MTF Trend"
+    description: "Multi-timeframe EMA pullback — HTF bias + LTF EMA retest + regime filter"
+    default_timeframe: "1d"
+    supported_timeframes: ["1h", "4h", "1d", "1wk"]
+    lookback_days: 400
+    expiry_days: 5
+    class: "p3_backtester.strategies.mtf_trend.MTFTrendStrategy"
+    signal_conditions: |
+      LONG signal fires when ALL of the following conditions are met:
+      1. Weekly trend: weekly EMA20 > weekly EMA50
+      2. Daily trend: daily EMA20 > daily EMA50
+      3. Price pullback to EMA20: |price - EMA20| / ATR <= pullback_max_atr
+      4. Prior distance: price was >= min_prior_distance_atr ATR from EMA20 in last N bars
+      5. RSI(14) <= rsi_max (not overbought)
+      6. ADX(14) >= adx_threshold (trend has minimum strength)
+      7. Regime: SMA200 slope is bullish (blocks longs in bear markets)
+
+      SHORT signal: mirrors long with reversed conditions.
+
+      Entry/exit (long):
+        entry_low  = EMA20 - (0.3 × ATR)
+        entry_high = EMA20 + (0.5 × ATR)
+        stop_loss  = N-bar swing low - (sl_buffer_atr × ATR)
+        risk       = entry_high - stop_loss
+        tp1        = entry_high + (tp1_r × risk)
+        tp2        = entry_high + (tp2_r × risk)
+    params:
+      ema_fast: 20
+      ema_slow: 50
+      adx_threshold: 20
+      adx_threshold_short: 15
+      pullback_max_atr: 1.2
+      min_prior_distance_atr: 1.5
+      prior_lookback: 5
+      rsi_max: 65
+      rsi_min: 35
+      sl_buffer_atr: 0.15
+      sl_lookback: 15
+      tp1_r: 2.5
+      tp2_r: 4.0
+      tp1_alloc: 70
+      tp2_alloc: 30
+      win_rate: 0.48
+      regime_filter: true
+      shorts_enabled: true
+
+  orb:
+    name: "Opening Range Breakout"
+    description: "Breakout above/below the opening range — timeframe-agnostic (range defined in minutes)"
+    default_timeframe: "15m"
+    supported_timeframes: ["1m", "5m", "15m", "30m", "1h"]
+    lookback_days: 5
+    expiry_days: 1
+    class: "p3_backtester.strategies.orb.ORBStrategy"
+    signal_conditions: |
+      LONG signal fires when ALL of the following conditions are met:
+      1. Bar closes above opening range high
+      2. Bar volume >= volume_multiplier × avg opening-range bar volume
+      3. Bar close > session VWAP (if require_vwap_filter=true)
+      4. Bar body >= body_pct_min × total bar size (conviction close)
+      5. Within trade_window_bars bars after opening range ends
+      6. Range size in [range_min_atr_factor, range_max_atr_factor] × daily ATR
+      7. RSI <= rsi_max_long
+      8. Daily EMA20 > EMA50 (if daily_trend_filter=true)
+
+      Session is skipped if overnight gap > max_gap_pct.
+    params:
+      opening_range_minutes: 30   # duration of opening range in minutes (auto-converts to bars)
+      trade_window_minutes: 90    # how long after opening range to scan for breakout
+      volume_multiplier: 1.5
+      range_min_atr_factor: 0.3
+      range_max_atr_factor: 2.5
+      body_pct_min: 0.5
+      rsi_max_long: 70
+      rsi_min_short: 30
+      tp1_r: 1.0
+      tp2_r: 2.0
+      tp1_alloc: 70
+      tp2_alloc: 30
+      sl_buffer_factor: 0.1
+      max_gap_pct: 0.01
+      long_enabled: true
+      short_enabled: true
+      require_vwap_filter: true
+      daily_trend_filter: true
+
+  momentum_breakout:
+    name: "Momentum Breakout"
+    description: "N-period high breakout with volume expansion and HTF bias — any timeframe"
+    default_timeframe: "1d"
+    supported_timeframes: ["1h", "4h", "1d", "1wk"]
+    lookback_days: 60
+    expiry_days: 3
+    class: "p3_backtester.strategies.momentum_breakout.MomentumBreakoutStrategy"
+    signal_conditions: |
+      LONG signal fires when ALL of the following conditions are met:
+      1. Today's close > 20-day high (breakout on daily close)
+      2. Today's volume >= volume_multiplier × 20-day avg volume
+      3. (close - low) / (high - low) >= 1 - close_top_pct  (conviction close)
+      4. Yesterday's ADX(14) < adx_max_before  (was consolidating, now breaking out)
+      5. RSI(14) in [rsi_min, rsi_max]  (momentum confirmed, not overbought)
+      6. Weekly EMA20 > weekly EMA50  (higher timeframe aligned)
+
+      Entry/exit (long):
+        consolidation_height = 20-day high - 20-day low
+        entry_low  = today's close
+        entry_high = today's close + (0.2 × ATR)
+        stop_loss  = 20-day low
+        tp1        = entry_high + consolidation_height
+        tp2        = entry_high + (2 × consolidation_height)
+    params:
+      lookback_periods: 20    # N-period high lookback (was lookback_days — now interval-agnostic)
+      volume_multiplier: 1.5
+      close_top_pct: 0.25
+      adx_max_before: 25
+      rsi_min: 50
+      rsi_max: 70
+      tp1_alloc: 70
+      tp2_alloc: 30
+
+  ema_continuation:
+    name: "EMA Continuation"
+    description: "EMA pullback entry in a trending market — any timeframe"
+    default_timeframe: "1d"
+    supported_timeframes: ["15m", "30m", "1h", "4h", "1d"]
+    lookback_days: 60
+    expiry_days: 3
+    class: "p3_backtester.strategies.ema_continuation.EMAContinuationStrategy"
+    signal_conditions: |
+      LONG signal fires when ALL of the following conditions are met:
+      1. ADX(14) >= adx_threshold (trend is active)
+      2. Price within pullback_max_atr × ATR of EMA (pullback has arrived)
+      3. Price was >= min_prior_distance_atr × ATR from EMA in last 5 bars (genuine pullback)
+      4. Daily close > daily EMA200 (macro regime: bull market only)
+      5. RSI(14) <= 65
+
+      Entry/exit (long):
+        entry_low  = EMA - (0.3 × ATR)
+        entry_high = EMA + (0.2 × ATR)
+        stop_loss  = EMA - (1.0 × ATR)
+        risk       = entry_high - stop_loss
+        tp1        = entry_high + (tp1_r × risk)
+        tp2        = entry_high + (tp2_r × risk)
+    params:
+      ema_period: 20
+      adx_threshold: 25
+      pullback_max_atr: 1.5
+      min_prior_distance_atr: 1.5
+      rsi_max: 65
+      tp1_r: 1.5
+      tp2_r: 3.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      win_rate: 0.50
+
+  ema_pullback:
+    name: "EMA Pullback"
+    description: "Deep EMA overshoot bounce at structural support — any timeframe"
+    default_timeframe: "1d"
+    supported_timeframes: ["15m", "30m", "1h", "4h", "1d"]
+    lookback_days: 60
+    expiry_days: 3
+    class: "p3_backtester.strategies.ema_pullback.EMAPullbackStrategy"
+    signal_conditions: |
+      LONG signal fires when ALL of the following conditions are met:
+      1. Price is 0.1 – 2.5 × ATR BELOW EMA (deep pullback / overshoot)
+      2. RSI(14) < 55 (confirms pullback momentum, not reversal)
+      3. Nearest support is within 1.2 × ATR of current price
+      4. ADX(14) >= adx_threshold (minimum trend active)
+
+      Entry/exit (long):
+        entry_low  = support - (0.2 × ATR)
+        entry_high = support + (0.2 × ATR)
+        stop_loss  = support - (1.5 × ATR)
+        risk       = entry_high - stop_loss
+        tp1        = entry_high + (tp1_r × risk)
+        tp2        = entry_high + (tp2_r × risk)
+    params:
+      ema_period: 20
+      adx_threshold: 18
+      rsi_max: 55
+      tp1_r: 1.5
+      tp2_r: 3.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      win_rate: 0.45

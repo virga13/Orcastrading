@@ -153,7 +153,7 @@ class BiasOutput(BaseModel):
 
     # Metadata
     asset: str
-    asset_class: Literal["equity", "forex", "crypto", "commodity"]
+    asset_class: Literal["equity", "forex", "crypto", "commodity", "index"]
     analysis_timestamp: str  # ISO 8601
 
     # Core signal
@@ -182,3 +182,35 @@ class BiasOutput(BaseModel):
     confidence_breakdown: ConfidenceBreakdown
     data_quality_flags: list[str]
     suggested_timeframe: Literal["intraday", "swing_1-5d", "positional_1-4w", "macro_1-3m"]
+
+
+# ── Strategy Scanner (P1 AI signal detection) ─────────────────────────────────
+
+class StrategySignal(BaseModel):
+    """AI evaluation of one strategy for one asset on one day."""
+    strategy_id: str
+    fired: bool
+    direction: Optional[Literal["long", "short"]] = None
+    entry_low: Optional[float] = None
+    entry_high: Optional[float] = None
+    stop_loss: Optional[float] = None
+    tp1: Optional[float] = None
+    tp2: Optional[float] = None
+    rr: Optional[float] = None
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    rationale: str = ""
+    conditions_met: list[str] = []
+    conditions_failed: list[str] = []
+
+
+class StrategyScannerOutput(BaseModel):
+    """Complete AI scan result for one asset: market regime + all strategy signals."""
+    asset_id: str
+    ticker: str
+    label: str
+    current_price: float
+    atr: float
+    rsi: float
+    analysis_date: str
+    market_regime: Literal["bull_trend", "bear_trend", "ranging", "uncertain"]
+    signals: list[StrategySignal]

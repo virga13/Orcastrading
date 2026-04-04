@@ -181,6 +181,30 @@ def _generate_html(stats: RunStats, trades: list[TradeRecord]) -> str:
     </div>
   </div>
 
+  <!-- RISK METRICS ROW -->
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:16px">
+    <div class="stat-card">
+      <div class="stat-val" style="color:{'var(--bull)' if stats.calmar_ratio >= 2.0 else ('var(--gold)' if stats.calmar_ratio >= 1.0 else 'var(--bear)')}">{stats.calmar_ratio:.2f}x</div>
+      <div class="stat-label">Calmar Ratio</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:6px">Total net R / Max drawdown &middot; &ge;2.0 target</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-val" style="color:var(--bear)">-{stats.max_drawdown_r:.2f}R</div>
+      <div class="stat-label">Max Drawdown</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:6px">Duration: {stats.max_drawdown_duration} trades in drawdown</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-val" style="color:var(--bull)">{stats.max_win_streak}</div>
+      <div class="stat-label">Max Win Streak</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:6px">Consecutive winning trades</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-val" style="color:var(--bear)">{stats.max_loss_streak}</div>
+      <div class="stat-label">Max Loss Streak</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:6px">Consecutive losing trades &middot; Kelly: {stats.kelly_25pct*100:.1f}%</div>
+    </div>
+  </div>
+
   <!-- CHARTS ROW -->
   <div class="grid2">
     <div class="card">

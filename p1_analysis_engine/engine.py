@@ -19,6 +19,7 @@ def analyze(ticker: str, model: str = "claude-sonnet-4-6", interval: str = "1d",
     """
     ticker = resolve_ticker(ticker)
     asset_class = classify_asset(ticker)
+    fetcher_class = "equity" if asset_class == "index" else asset_class
     asset_name = get_asset_name(ticker)
     flags: list[str] = []
 
@@ -32,7 +33,7 @@ def analyze(ticker: str, model: str = "claude-sonnet-4-6", interval: str = "1d",
 
     # --- Macro (optional) ---
     try:
-        macro = fetch_macro(asset_class)
+        macro = fetch_macro(fetcher_class)
         flags.extend(macro.pop("data_quality_flags", []))
     except MacroFetchError as e:
         macro = _empty_macro()
@@ -52,7 +53,7 @@ def analyze(ticker: str, model: str = "claude-sonnet-4-6", interval: str = "1d",
 
     # --- Geopolitical (optional) ---
     try:
-        geopolitical = fetch_geopolitical(asset_class, asset_name)
+        geopolitical = fetch_geopolitical(fetcher_class, asset_name)
     except Exception as e:
         geopolitical = _empty_geo()
         flags.append(f"geopolitical_error: {e}")
@@ -82,6 +83,7 @@ def analyze_full(ticker: str, model: str = "claude-sonnet-4-6", interval: str = 
     """
     ticker = resolve_ticker(ticker)
     asset_class = classify_asset(ticker)
+    fetcher_class = "equity" if asset_class == "index" else asset_class
     asset_name = get_asset_name(ticker)
     flags: list[str] = []
 
@@ -93,7 +95,7 @@ def analyze_full(ticker: str, model: str = "claude-sonnet-4-6", interval: str = 
         raise RuntimeError(f"Technical fetch failed for {ticker}: {e}")
 
     try:
-        macro = fetch_macro(asset_class)
+        macro = fetch_macro(fetcher_class)
         flags.extend(macro.pop("data_quality_flags", []))
     except MacroFetchError as e:
         macro = _empty_macro()
@@ -111,7 +113,7 @@ def analyze_full(ticker: str, model: str = "claude-sonnet-4-6", interval: str = 
         flags.append(f"news_error: {e}")
 
     try:
-        geopolitical = fetch_geopolitical(asset_class, asset_name)
+        geopolitical = fetch_geopolitical(fetcher_class, asset_name)
     except Exception as e:
         geopolitical = _empty_geo()
         flags.append(f"geopolitical_error: {e}")

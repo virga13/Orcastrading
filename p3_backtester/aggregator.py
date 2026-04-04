@@ -157,6 +157,15 @@ def compute_stats(
     from p3_backtester.walk_forward import kelly_from_stats
     avg_net_pnl_r = round(sum(t.net_pnl_r for t in filled) / len(filled), 4) if filled else 0.0
 
+    # Calmar ratio: total net R earned per unit of max drawdown
+    # Interpretation: if Calmar = 2.0, you made 2R total for every 1R of worst drawdown
+    total_net_r = sum(t.net_pnl_r for t in filled)
+    calmar = round(total_net_r / drawdown, 4) if drawdown > 0 else 0.0
+
+    # Drawdown duration and streaks
+    dd_duration = compute_drawdown_duration(equity)
+    max_win_streak, max_loss_streak = compute_streaks(filled)
+
     stats = RunStats(
         ticker=config.ticker,
         interval=config.interval,
@@ -180,9 +189,59 @@ def compute_stats(
         by_trade_type=by_type,
         by_direction=by_dir,
         by_priority=by_pri,
+        calmar_ratio=calmar,
+        max_drawdown_duration=dd_duration,
+        max_win_streak=max_win_streak,
+        max_loss_streak=max_loss_streak,
     )
     stats.kelly_25pct = kelly_from_stats(stats, 0.25)
     return stats
+
+
+def compute_drawdown_duration(equity_curve: list[float]) -> int:
+    """
+    Max number of consecutive filled trades spent below the prior equity peak.
+    This is the drawdown duration in trade-count units (not calendar time).
+    """
+    if not equity_curve:
+        return 0
+    peak = equity_curve[0]
+    current_dd_len = 0
+    max_dd_len = 0
+    for val in equity_curve:
+        if val >= peak:
+            peak = val
+            current_dd_len = 0
+        else:
+            current_dd_len += 1
+            if current_dd_len > max_dd_len:
+                max_dd_len = current_dd_len
+    return max_dd_len
+
+
+def compute_streaks(filled: list[TradeRecord]) -> tuple[int, int]:
+    """
+    Compute max win streak and max loss streak from filled trades ordered by fill_bar_index.
+    Returns (max_win_streak, max_loss_streak).
+    """
+    if not filled:
+        return 0, 0
+    ordered = sorted(filled, key=lambda t: (t.fill_bar_index or 0))
+    max_win = cur_win = 0
+    max_loss = cur_loss = 0
+    for t in ordered:
+        if t.outcome in ("WIN", "PARTIAL_WIN"):
+            cur_win += 1
+            cur_loss = 0
+            max_win = max(max_win, cur_win)
+        elif t.outcome == "LOSS":
+            cur_loss += 1
+            cur_win = 0
+            max_loss = max(max_loss, cur_loss)
+        else:
+            # BREAKEVEN resets neither streak
+            pass
+    return max_win, max_loss
 
 
 def compute_equity_curve(filled_trades: list[TradeRecord]) -> list[float]:

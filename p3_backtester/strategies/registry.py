@@ -13,28 +13,73 @@ from p3_backtester.strategies.base import StrategyBase
 from p3_backtester.strategies.ema_continuation import EMAContinuationStrategy
 from p3_backtester.strategies.ema_pullback import EMAPullbackStrategy
 from p3_backtester.strategies.mtf_trend import MTFTrendStrategy
+from p3_backtester.strategies.orb import ORBStrategy
+from p3_backtester.strategies.momentum_breakout import MomentumBreakoutStrategy
 
-# Lazy import to avoid circular imports
 def _get_rule_engine_strategy():
     from p3_backtester.strategies.rule_engine_strategy import RuleEngineStrategy
     return RuleEngineStrategy
 
 
+# ── Core config-driven factory ────────────────────────────────────────────────
+
+def build_from_config(strategy_id: str, param_overrides: dict | None = None) -> StrategyBase:
+    """
+    Instantiate a strategy by its config ID (from config/strategies.yaml).
+    Loads default params from config and applies any overrides.
+
+    Usage:
+        strategy = build_from_config("mtf_trend")
+        strategy = build_from_config("orb", {"volume_multiplier": 2.0})
+    """
+    from core.config import get_strategy_params
+
+    defaults = get_strategy_params(strategy_id)
+    params   = {**defaults, **(param_overrides or {})}
+
+    def _kw(cls, p):
+        """Filter params to only those accepted by cls.__init__."""
+        return {k: v for k, v in p.items() if k in cls.__init__.__code__.co_varnames}
+
+    _MAP = {
+        "mtf_trend":         lambda p: MTFTrendStrategy(**_kw(MTFTrendStrategy, p)),
+        "orb":               lambda p: ORBStrategy(**_kw(ORBStrategy, p)),
+        "momentum_breakout": lambda p: MomentumBreakoutStrategy(**_kw(MomentumBreakoutStrategy, p)),
+        "ema_continuation":  lambda p: EMAContinuationStrategy(**_kw(EMAContinuationStrategy, p)),
+        "ema_pullback":      lambda p: EMAPullbackStrategy(**_kw(EMAPullbackStrategy, p)),
+        "rule_engine":       lambda p: _get_rule_engine_strategy()(),
+    }
+
+    if strategy_id not in _MAP:
+        raise KeyError(
+            f"Unknown strategy '{strategy_id}'. "
+            f"Available: {list(_MAP.keys())}"
+        )
+    return _MAP[strategy_id](params)
+
+
 # ── Strategy keyword map ─────────────────────────────────────────────────────
 # Order matters — more specific phrases must come first
 _STRATEGY_KEYWORDS: list[tuple[str, str]] = [
-    ("mtf trend",        "MTFTrend"),
-    ("multi timeframe",  "MTFTrend"),
-    ("multi-timeframe",  "MTFTrend"),
-    ("htf",              "MTFTrend"),
-    ("ema retest",       "MTFTrend"),
-    ("ema continuation", "EMAContinuation"),
-    ("ema trend",        "EMAContinuation"),
-    ("ema pullback",     "EMAPullback"),
-    ("ema bounce",       "EMAPullback"),
-    ("ema overshoot",    "EMAPullback"),
-    ("rule engine",      "RuleEngine"),
-    ("default",          "RuleEngine"),
+    ("ema continuation",   "EMAContinuation"),
+    ("ema trend",          "EMAContinuation"),
+    ("ema pullback",       "EMAPullback"),
+    ("ema bounce",         "EMAPullback"),
+    ("ema overshoot",      "EMAPullback"),
+    ("mtf trend",          "MTFTrend"),
+    ("multi timeframe",    "MTFTrend"),
+    ("multi-timeframe",    "MTFTrend"),
+    ("htf",                "MTFTrend"),
+    ("ema retest",         "MTFTrend"),
+    ("opening range",      "ORB"),
+    ("orb",                "ORB"),
+    ("momentum breakout",  "MomentumBreakout"),
+    ("momentum",           "MomentumBreakout"),
+    ("breakout",           "MomentumBreakout"),
+    ("pullback",           "EMAContinuation"),
+    ("trend",              "MTFTrend"),
+    ("rule engine",        "RuleEngine"),
+    ("default",            "RuleEngine"),
 ]
 
 # ── Interval aliases ─────────────────────────────────────────────────────────
@@ -55,20 +100,27 @@ _NUMBER_PATTERN = re.compile(r'\b(\d+)\b')
 def list_strategies() -> list[str]:
     """Return all available strategy names."""
     return [
-        "MTF Trend (recommended) — multi-timeframe: HTF EMA20/50 bias + ETF EMA20 retest",
-        "EMA Continuation — single-timeframe EMA pullback with ADX filter",
-        "EMA Pullback — deep overshoot bounce at S/R",
-        "Rule Engine (default) — deterministic rule-based setups",
+        "mtf_trend         (1d)  — multi-timeframe EMA pullback with regime filter",
+        "orb               (15m) — opening range breakout with volume + VWAP",
+        "momentum_breakout (1d)  — N-day high breakout with volume expansion",
+        "ema_continuation  (1d)  — EMA pullback in trending market with ADX filter",
+        "ema_pullback      (1d)  — deep EMA overshoot bounce at structural support",
+        "rule_engine             — deterministic rule-based setups (default/legacy)",
     ]
 
 
 def build_strategy(name: str, params: dict) -> StrategyBase:
-    """Instantiate a strategy by name with given params."""
+    """Instantiate a strategy by class name with given params."""
     ema_period    = int(params.get("ema_period", 20))
     adx_threshold = int(params.get("adx_threshold", 20))
 
     if name == "MTFTrend":
         return MTFTrendStrategy(ema_fast=ema_period, adx_threshold=adx_threshold)
+    if name == "ORB":
+        return ORBStrategy(**{k: v for k, v in params.items()
+                              if k in ORBStrategy.__init__.__code__.co_varnames})
+    if name == "MomentumBreakout":
+        return MomentumBreakoutStrategy()
     if name == "EMAContinuation":
         return EMAContinuationStrategy(ema_period=ema_period, adx_threshold=adx_threshold)
     if name == "EMAPullback":
@@ -84,7 +136,7 @@ def parse_query(query: str) -> dict:
     Returns
     -------
     dict with keys:
-      strategy_name : str   — "EMAContinuation" | "EMAPullback" | "RuleEngine"
+      strategy_name : str   — "EMAContinuation" | "EMAPullback" | "RuleEngine" etc.
       params        : dict  — {"ema_period": int, "adx_threshold": int}
       ticker        : str | None  — resolved yfinance ticker, or None if not found
       interval      : str   — e.g. "1h"
@@ -99,7 +151,7 @@ def parse_query(query: str) -> dict:
       → {strategy_name: "EMAPullback", params: {ema_period:20}, ticker: "BTC-USD", interval: "5m"}
 
     "50 EMA trend NASDAQ daily"
-      → {strategy_name: "EMAContinuation", params: {ema_period:50}, ticker: "^NDX", interval: "1d"}
+      → {strategy_name: "MTFTrend", params: {ema_period:50}, ticker: "^NDX", interval: "1d"}
     """
     from p1_analysis_engine.utils.asset_classifier import resolve_ticker
 
@@ -115,7 +167,6 @@ def parse_query(query: str) -> dict:
     # ── EMA period — first number in query ───────────────────────────────────
     numbers = _NUMBER_PATTERN.findall(query)
     ema_period = int(numbers[0]) if numbers else 20
-    # Clamp to sensible range
     ema_period = max(5, min(ema_period, 500))
 
     # ── Interval ─────────────────────────────────────────────────────────────
@@ -127,9 +178,7 @@ def parse_query(query: str) -> dict:
 
     # ── Ticker — try every word against asset_classifier ─────────────────────
     ticker = None
-    # Extract clean words (uppercase for ticker matching)
     words = re.findall(r'\b[A-Za-z][A-Za-z0-9\-=^]*\b', query)
-    # Skip common English words that will never be tickers
     stop_words = {
         "backtest", "test", "run", "for", "on", "at", "the", "a", "an",
         "with", "ema", "pullback", "continuation", "trend", "strategy",
@@ -140,13 +189,10 @@ def parse_query(query: str) -> dict:
         if word.lower() in stop_words:
             continue
         candidate = resolve_ticker(word.upper())
-        # If resolve_ticker changed the word, it's a known alias (e.g. GOLD → GC=F)
-        # If it stayed the same and looks like a real ticker (ALL CAPS, short), accept it
         if candidate != word.upper():
             ticker = candidate
             break
         if word.upper() == word and 2 <= len(word) <= 7 and word.upper() not in stop_words:
-            # Looks like a ticker (AAPL, BTC, etc.) — accept as-is
             ticker = word.upper()
             break
 

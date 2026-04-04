@@ -1,24 +1,20 @@
 """
-run_batch.py — cross-asset batch backtest using MTF Trend strategy.
+run_batch.py — focused cross-asset backtest: SPX500, NAS100, US30 long-only.
+
+Results from the v1 run (2026-03-31) showed:
+  - Short side has no edge in 2015-2026 bull market (10-15% WR on shorts)
+  - Long side is genuinely strong: SPX500 38.2% WR / PF 2.25, NAS100 39.0% / PF 2.10
+  - Gold / Brent / Bitcoin rejected — no structural edge with EMA trend-following
+
+This run:
+  - Long-only mode (shorts_enabled=False)
+  - Walk-forward validation (60% train / 20% val / 20% test)
+  - Regime filter active (SMA200 — no longs in confirmed bear)
+  - Directional prior distance gate active (v1 bug fix)
 
 Usage:
     python run_batch.py
-
-Strategy: MTF Trend (Multi-Timeframe Trend Following)
-  Entry:  1D bars — 10-year window (2015-2026)
-  Bias:   1W (resampled from daily data inside strategy — zero lookahead)
-  Signal: EMA20/50 aligned on weekly + price retesting EMA20 on daily
-  RSI:    not overbought on entry
-  Stop:   structural swing low/high (15-bar lookback)
-  Target: TP1 2.5R (70%), TP2 4.0R (30%)
-
-Data sources (auto-fallback chain):
-  Gold, Silver, Brent, Indices -> Stooq (free, 10-20yr daily) -> yfinance
-  Bitcoin -> CCXT/Binance (full history) -> yfinance
-
-Expected fills: ~50-150 per asset over 10 years — statistically meaningful.
 """
-
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
@@ -26,6 +22,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 sys.path.insert(0, str(Path(__file__).parent))
 
+import pandas as pd
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -33,27 +30,82 @@ from rich import box
 
 console = Console()
 
-ASSETS = ["GC=F", "SI=F", "BTC-USD", "^GSPC", "^GDAXI", "^DJI", "^NDX", "BZ=F"]
+ASSETS = ["^GSPC", "^NDX", "^DJI"]
 ASSET_LABELS = {
-    "GC=F":    "Gold",
-    "SI=F":    "Silver",
-    "BTC-USD": "Bitcoin",
-    "^GSPC":   "SPX500",
-    "^GDAXI":  "GER40",
-    "^DJI":    "US30",
-    "^NDX":    "NAS100",
-    "BZ=F":    "Brent",
+    "^GSPC": "SPX500",
+    "^NDX":  "NAS100",
+    "^DJI":  "US30",
 }
 
-# (interval, start, end, entry_timeout_bars, signal_mode, every_n)
-# 1D bars — 10-year window; weekly bias resampled inside strategy
-INTERVALS = [
-    ("1d", "2015-01-01", "2026-03-28", 10, "session-open", 1),
-]
+# 1D entry / 1W bias — 10-year window
+START = "2015-01-01"
+END   = "2026-03-28"
 
 
-def run_one(ticker: str, interval: str, start: str, end: str,
-            entry_timeout: int = 20, signal_mode: str = "session-open", every_n: int = 10):
+def _run_walk_forward(config, df, strategy, asset_class):
+    """Run train/val/test sub-windows and return list[WalkForwardWindow]."""
+    from p3_backtester.walk_forward import compute_walk_forward_dates, kelly_from_stats
+    from p3_backtester.pass1_signal_gen import run_pass1
+    from p3_backtester.pass2_simulator import run_pass2
+    from p3_backtester.aggregator import compute_stats
+    from p3_backtester.signal_scheduler import get_signal_indices
+    from p3_backtester.market_data import split_backtest_window
+    from p3_backtester.schema import WalkForwardWindow
+
+    try:
+        train_r, val_r, test_r = compute_walk_forward_dates(df, config.start_date, config.end_date)
+    except ValueError as e:
+        console.print(f"  [yellow]Walk-forward skipped: {e}[/yellow]")
+        return []
+
+    windows = [("train", train_r), ("validation", val_r), ("test", test_r)]
+    results = []
+
+    for wname, (wstart, wend) in windows:
+        first_valid, _ = split_backtest_window(df, wstart)
+        w_indices = get_signal_indices(df, config.signal_mode, first_valid, config.every_n_bars)
+        wstart_ts = pd.Timestamp(wstart)
+        wend_ts   = pd.Timestamp(wend)
+        w_indices = [i for i in w_indices if wstart_ts <= df.index[i] <= wend_ts]
+
+        if not w_indices:
+            continue
+
+        w_config  = config.model_copy(update={"start_date": wstart, "end_date": wend})
+        w_signals = run_pass1(w_config, df, w_indices, use_claude=False, strategy=strategy)
+        if not w_signals:
+            continue
+        w_trades  = run_pass2(w_config, df, w_signals, asset_class=asset_class)
+        if not w_trades:
+            continue
+        w_stats   = compute_stats(w_config, w_signals, w_trades, strategy_name=strategy.name)
+
+        filled    = [t for t in w_trades if t.outcome != "EXPIRED"]
+        wins      = [t for t in filled if t.outcome in ("WIN", "PARTIAL_WIN")]
+        losses    = [t for t in filled if t.outcome == "LOSS"]
+        net_gp    = sum(t.net_pnl_r for t in wins)
+        net_gl    = abs(sum(t.net_pnl_r for t in losses))
+        net_pf    = net_gp / net_gl if net_gl > 0 else (999.0 if net_gp > 0 else 0.0)
+
+        results.append(WalkForwardWindow(
+            name=wname,
+            start_date=wstart,
+            end_date=wend,
+            n_fills=len(filled),
+            win_rate=w_stats.actual_win_rate,
+            avg_pnl_r=w_stats.actual_avg_pnl_r,
+            avg_net_pnl_r=w_stats.actual_avg_net_pnl_r,
+            profit_factor=w_stats.actual_profit_factor,
+            net_profit_factor=round(net_pf, 3),
+            max_drawdown_r=w_stats.max_drawdown_r,
+            sharpe_r=w_stats.sharpe_r,
+            kelly_25pct=kelly_from_stats(w_stats),
+        ))
+
+    return results
+
+
+def run_one(ticker: str):
     from p3_backtester.schema import BacktestConfig
     from p3_backtester.market_data import fetch_ohlcv, split_backtest_window, MarketDataError
     from p3_backtester.signal_scheduler import get_signal_indices
@@ -66,47 +118,50 @@ def run_one(ticker: str, interval: str, start: str, end: str,
     strategy = MTFTrendStrategy(
         ema_fast=20,
         ema_slow=50,
-        adx_threshold=20,        # daily ADX is more stable; 20 is appropriate
-        pullback_max_atr=1.5,    # daily candles are larger — allow slightly more slack
+        adx_threshold=20,
+        adx_threshold_short=15,
+        pullback_max_atr=1.5,
         min_prior_distance_atr=1.5,
         prior_lookback=5,
         rsi_max=65,
         rsi_min=35,
         sl_buffer_atr=0.15,
-        sl_lookback=10,          # swing lookback in daily bars (~2 weeks)
+        sl_lookback=10,
         tp1_r=2.5,
         tp2_r=4.0,
         tp1_alloc=70,
         tp2_alloc=30,
         win_rate=0.48,
+        regime_filter=True,
+        shorts_enabled=False,       # long-only: short side has no edge 2015-2026
     )
 
     config = BacktestConfig(
         ticker=ticker,
-        interval=interval,
-        start_date=start,
-        end_date=end,
-        signal_mode=signal_mode,
-        every_n_bars=every_n,
-        entry_timeout_bars=entry_timeout,
+        interval="1d",
+        start_date=START,
+        end_date=END,
+        signal_mode="session-open",
+        every_n_bars=1,
+        entry_timeout_bars=10,
         model="claude-sonnet-4-6",
         force_regenerate=True,
-        top_adx_pct=1.0,        # no percentile filter — let all signals through
+        top_adx_pct=1.0,
     )
 
     asset_class = classify_asset(ticker)
 
     try:
-        df = fetch_ohlcv(ticker, interval, start, end, source="auto")
+        df = fetch_ohlcv(ticker, "1d", START, END, source="auto")
         console.print(f"  [dim]{len(df)} bars loaded[/dim]")
     except MarketDataError as e:
         return None, str(e)
 
-    first_valid, _ = split_backtest_window(df, start)
+    first_valid, _ = split_backtest_window(df, START)
     signal_indices = get_signal_indices(df, config.signal_mode, first_valid, config.every_n_bars)
 
     if not signal_indices:
-        return None, "No signal bars available (insufficient warmup data)"
+        return None, "No signal bars (insufficient warmup)"
 
     signals = run_pass1(config, df, signal_indices, use_claude=False, strategy=strategy)
     if not signals:
@@ -117,6 +172,12 @@ def run_one(ticker: str, interval: str, start: str, end: str,
         return None, "No trades simulated"
 
     stats = compute_stats(config, signals, trades, strategy_name=strategy.name)
+
+    # Walk-forward
+    console.print("  [dim]Running walk-forward validation ...[/dim]")
+    wf = _run_walk_forward(config, df, strategy, asset_class)
+    stats.walk_forward = wf
+
     save_to_db(config, signals, trades, stats)
     return stats, None
 
@@ -124,72 +185,93 @@ def run_one(ticker: str, interval: str, start: str, end: str,
 def main():
     console.print()
     console.print(Panel(
-        "[bold gold1]ORCASTRADING[/bold gold1]  [dim]MTF Trend — 1D entry / 1W bias — 10-Year Cross-Asset Test[/dim]",
+        "[bold gold1]ORCASTRADING[/bold gold1]  "
+        "[dim]MTF Trend — Long-Only — SPX500 / NAS100 / US30 — 10Y Walk-Forward[/dim]",
         box=box.ROUNDED, padding=(1, 4),
     ))
 
-    results = []   # list of (label, interval, stats | None, error | None)
+    results = []
 
-    total = len(ASSETS) * len(INTERVALS)
-    done  = 0
-
-    for interval, start, end, timeout, sig_mode, every_n in INTERVALS:
-        for ticker in ASSETS:
-            done += 1
-            label = ASSET_LABELS[ticker]
-            console.print(f"\n[bold][{done}/{total}] {label} - {interval}[/bold]  [dim]{start} to {end} ({sig_mode})[/dim]")
-            stats, err = run_one(ticker, interval, start, end,
-                                 entry_timeout=timeout, signal_mode=sig_mode, every_n=every_n)
-            results.append((label, interval, stats, err))
-            if err:
-                console.print(f"  [red]FAILED:[/red] {err}")
+    for i, ticker in enumerate(ASSETS, 1):
+        label = ASSET_LABELS[ticker]
+        console.print(f"\n[bold][{i}/{len(ASSETS)}] {label}[/bold]  [dim]{START} to {END}[/dim]")
+        stats, err = run_one(ticker)
+        results.append((label, ticker, stats, err))
+        if err:
+            console.print(f"  [red]FAILED:[/red] {err}")
 
     # ── Summary table ────────────────────────────────────────────────────────
     console.print()
-    console.print(Panel("[bold]Batch Results Summary[/bold]", box=box.ROUNDED))
+    console.print(Panel("[bold]Overall Results (Long-Only)[/bold]", box=box.ROUNDED))
 
-    for interval, _, _, _, _, _ in INTERVALS:
-        t = Table(
-            title=f"Interval: {interval}",
-            box=box.SIMPLE_HEAVY,
-            show_header=True,
-            padding=(0, 2),
+    t = Table(box=box.SIMPLE_HEAVY, show_header=True, padding=(0, 2))
+    t.add_column("Asset",   style="bold", width=8)
+    t.add_column("Fills",   justify="right")
+    t.add_column("Win %",   justify="right")
+    t.add_column("Avg R",   justify="right")
+    t.add_column("Net PF",  justify="right")
+    t.add_column("MaxDD",   justify="right")
+    t.add_column("Sharpe",  justify="right")
+    t.add_column("Calmar",  justify="right")
+    t.add_column("Kelly",   justify="right")
+
+    for label, ticker, stats, err in results:
+        if err or stats is None:
+            t.add_row(label, "—", "—", "—", "—", "—", "—", f"[red]{err or 'ERR'}[/red]", "—")
+            continue
+        wr_c  = "green" if stats.actual_win_rate >= 0.35 else ("yellow" if stats.actual_win_rate >= 0.28 else "red")
+        pf_c  = "green" if stats.actual_net_profit_factor >= 1.5 else ("yellow" if stats.actual_net_profit_factor >= 1.0 else "red")
+        cal_c = "green" if stats.calmar_ratio >= 2.0 else ("yellow" if stats.calmar_ratio >= 1.0 else "red")
+        t.add_row(
+            label,
+            str(stats.total_trades_filled),
+            f"[{wr_c}]{stats.actual_win_rate:.1%}[/{wr_c}]",
+            f"{stats.actual_avg_net_pnl_r:+.3f}R",
+            f"[{pf_c}]{stats.actual_net_profit_factor:.2f}[/{pf_c}]",
+            f"-{stats.max_drawdown_r:.1f}R",
+            f"{stats.sharpe_r:.2f}",
+            f"[{cal_c}]{stats.calmar_ratio:.2f}[/{cal_c}]",
+            f"{stats.kelly_25pct*100:.1f}%",
         )
-        t.add_column("Asset",    style="bold", width=10)
-        t.add_column("Signals",  justify="right")
-        t.add_column("Fills",    justify="right")
-        t.add_column("Win %",    justify="right")
-        t.add_column("Avg R",    justify="right")
-        t.add_column("PF",       justify="right")
-        t.add_column("MaxDD",    justify="right")
-        t.add_column("Sharpe",   justify="right")
+    console.print(t)
 
-        for label, iv, stats, err in results:
-            if iv != interval:
-                continue
-            if err or stats is None:
-                t.add_row(label, "—", "—", "—", "—", "—", "—", f"[red]{err or 'ERR'}[/red]")
-                continue
+    # ── Walk-forward per asset ────────────────────────────────────────────────
+    for label, ticker, stats, err in results:
+        if err or stats is None or not stats.walk_forward:
+            continue
 
-            wr_color  = "green" if stats.actual_win_rate >= 0.50 else ("yellow" if stats.actual_win_rate >= 0.40 else "red")
-            r_color   = "green" if stats.actual_avg_pnl_r > 0    else "red"
-            pf_color  = "green" if stats.actual_profit_factor >= 1.5 else ("yellow" if stats.actual_profit_factor >= 1.0 else "red")
+        console.print()
+        console.print(f"[bold]{label}[/bold] — Walk-Forward (60% train / 20% val / 20% test)")
+        wf_t = Table(box=box.SIMPLE, show_header=True, padding=(0, 2))
+        wf_t.add_column("Window",     style="dim", width=12)
+        wf_t.add_column("Period",     width=26)
+        wf_t.add_column("Fills",      justify="right")
+        wf_t.add_column("Win %",      justify="right")
+        wf_t.add_column("Net Avg R",  justify="right")
+        wf_t.add_column("Net PF",     justify="right")
+        wf_t.add_column("MaxDD",      justify="right")
+        wf_t.add_column("Kelly 25%",  justify="right")
 
-            t.add_row(
-                label,
-                str(stats.total_signals),
-                str(stats.total_trades_filled),
-                f"[{wr_color}]{stats.actual_win_rate:.0%}[/{wr_color}]",
-                f"[{r_color}]{stats.actual_avg_pnl_r:+.2f}R[/{r_color}]",
-                f"[{pf_color}]{stats.actual_profit_factor:.2f}[/{pf_color}]",
-                f"-{stats.max_drawdown_r:.1f}R",
-                f"{stats.sharpe_r:.2f}",
+        for w in stats.walk_forward:
+            is_test = w.name == "test"
+            style   = "bold" if is_test else ""
+            pf_c    = "green" if w.net_profit_factor >= 1.0 else "red"
+            r_c     = "green" if w.avg_net_pnl_r > 0 else "red"
+            label_w = f"[{style}]{w.name.upper()}[/{style}]" if style else w.name.upper()
+            wf_t.add_row(
+                label_w,
+                f"{w.start_date} -> {w.end_date}",
+                str(w.n_fills),
+                f"{w.win_rate:.1%}",
+                f"[{r_c}]{w.avg_net_pnl_r:+.3f}R[/{r_c}]",
+                f"[{pf_c}]{w.net_profit_factor:.2f}[/{pf_c}]",
+                f"-{w.max_drawdown_r:.1f}R",
+                f"{w.kelly_25pct*100:.1f}%",
             )
-
-        console.print(t)
+        console.print(wf_t)
 
     console.print()
-    console.print("[dim]All results saved to p3_backtester/results/[/dim]\n")
+    console.print("[dim]Results saved to p3_backtester/results/[/dim]\n")
 
 
 if __name__ == "__main__":

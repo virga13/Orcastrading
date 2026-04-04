@@ -8,7 +8,7 @@ from p1_analysis_engine.utils.formatting import (
     format_news,
     format_geopolitical,
 )
-from typing import Literal
+from typing import Literal, Optional
 
 BIAS_SYSTEM_PROMPT = """You are a professional quantitative analyst and trading intelligence engine.
 Your role is to synthesize multi-source market data — technical indicators, macroeconomic
@@ -141,7 +141,7 @@ def _call_with_cache(client, model, system_prompt, tool_def, tool_name, user_pro
 
 def synthesize(
     ticker: str,
-    asset_class: Literal["equity", "forex", "crypto", "commodity"],
+    asset_class: Literal["equity", "forex", "crypto", "commodity", "index"],
     technical: dict,
     macro: dict,
     news: list[dict],
@@ -168,7 +168,7 @@ def synthesize(
 
 def synthesize_full(
     ticker: str,
-    asset_class: Literal["equity", "forex", "crypto", "commodity"],
+    asset_class: Literal["equity", "forex", "crypto", "commodity", "index"],
     technical: dict,
     macro: dict,
     news: list[dict],
@@ -209,3 +209,175 @@ def synthesize_full(
     )
 
     return bias, setups
+
+
+# ── Strategy Scanner synthesis ────────────────────────────────────────────────
+
+def synthesize_strategy_scan(
+    asset_id: str,
+    ticker: str,
+    label: str,
+    market_data: dict,
+    strategy_defs: list[dict],
+    model: str = "claude-sonnet-4-6",
+    macro_context: dict | None = None,
+    news_headlines: list[str] | None = None,
+):
+    """
+    Single Claude call that evaluates all daily strategies for one asset.
+    Returns a fully populated StrategyScannerOutput.
+    """
+    from p1_analysis_engine.schema import StrategySignal, StrategyScannerOutput
+    from pydantic import BaseModel
+    from typing import Literal
+
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+    md = market_data
+
+    # ── Market data block ────────────────────────────────────────────────────
+    def _fmt(v, decimals=4):
+        return f"{v:,.{decimals}f}" if v is not None else "N/A"
+
+    data_block = f"""## MARKET DATA — {label} ({ticker}) — {md['date']}
+
+Price:       {_fmt(md['price'])}
+ATR(14):     {_fmt(md['atr'])}  ({md['atr_pct']}% of price)
+RSI(14):     {md['rsi']}
+EMA20:       {_fmt(md['ema20'])}  (price is {md['price_atr_from_ema20']:+.3f} ATR from EMA20)
+EMA50:       {_fmt(md['ema50'])}
+EMA200:      {_fmt(md['ema200'])}
+ADX(14):     {md['adx_today']} today | {md['adx_prev']} yesterday
+
+Volume:      {md['volume_today']:,} today vs {md['volume_20d_avg']:,} 20d avg → ratio {md['volume_ratio']}x
+
+20-day high: {_fmt(md['high_20d'])}
+20-day low:  {_fmt(md['low_20d'])}
+
+Today's bar: open {_fmt(md['today_open'])} | low {_fmt(md['today_low'])} | high {_fmt(md['today_high'])} | close {_fmt(md['price'])}
+Close position in today's range: {md['close_pct_of_range']:.1%}  (1.0 = top, 0.0 = bottom)
+
+10-day swing high (prior bar): {_fmt(md['swing_high_10d'])}
+Distance from swing high:      {md['distance_from_swing_high_atr']:.3f} ATR  (positive = price is below swing high)
+
+## WEEKLY DATA
+Weekly EMA20:  {_fmt(md['weekly_ema20'])}
+Weekly EMA50:  {_fmt(md['weekly_ema50'])}
+Weekly RSI:    {md['weekly_rsi'] if md['weekly_rsi'] else 'N/A'}
+Weekly trend:  {md['weekly_trend']}  (bullish = weekly EMA20 > weekly EMA50)"""
+
+    # ── Strategy definitions block ────────────────────────────────────────────
+    strat_blocks = []
+    for s in strategy_defs:
+        strat_blocks.append(
+            f"### {s['name']} (strategy_id: \"{s['id']}\")\n{s['signal_conditions'].strip()}"
+        )
+    strategies_block = "\n\n".join(strat_blocks)
+
+    # ── Macro context block ───────────────────────────────────────────────────
+    macro_block = ""
+    if macro_context:
+        vix     = macro_context.get("vix_level")
+        vix_reg = macro_context.get("vix_regime", "")
+        ffr     = macro_context.get("fed_funds_rate")
+        yc      = macro_context.get("yield_curve", "")
+        cpi     = macro_context.get("cpi_trend", "")
+        usd     = macro_context.get("usd_trend", "")
+        mbias   = macro_context.get("macro_bias", "")
+        macro_block = f"""
+## MACRO CONTEXT
+VIX: {f'{vix:.1f}' if vix else 'N/A'}  ({vix_reg})   ← >25 = high fear, trend strategies underperform
+Fed Funds Rate: {f'{ffr:.2f}%' if ffr else 'N/A'}
+Yield curve: {yc}  |  CPI trend: {cpi}  |  USD trend: {usd}
+Macro bias: {mbias.upper() if mbias else 'N/A'}
+
+Note: VIX >30 or macro_bias=risk_off should reduce confidence in trend-following signals.
+Macro_bias=risk_on supports momentum and trend signals; risk_off favours caution."""
+
+    # ── News block ────────────────────────────────────────────────────────────
+    news_block = ""
+    if news_headlines:
+        headlines_text = "\n".join(f"  - {h}" for h in news_headlines)
+        news_block = f"""
+## RECENT NEWS HEADLINES (last 72h)
+{headlines_text}
+
+Note: Strong contra-news (e.g. surprise rate hike when bullish setup) should reduce
+confidence. Supportive news can add confidence but never replace technical conditions."""
+
+    user_prompt = f"""{data_block}{macro_block}{news_block}
+
+## STRATEGIES TO EVALUATE
+
+For each strategy below, check every numbered condition precisely against the market data above. A signal fires only when ALL conditions are met simultaneously. If any single condition fails, fired must be false.
+
+When assessing confidence, factor in macro context and news: a technically valid signal in a risk-off macro environment or contra-news should have confidence reduced by 0.1–0.2.
+
+{strategies_block}
+
+Evaluate all strategies and record results using the record_strategy_scan tool."""
+
+    system_prompt = """You are a quantitative signal evaluator. Your only job is to determine whether each strategy's conditions have fired, based solely on the numbers in the market data block. Do not use external knowledge, current market prices, or assumptions.
+
+Rules:
+- Evaluate each condition as a precise numeric check against the data provided
+- fired=true only when ALL listed conditions pass
+- If any condition fails, fired=false for that strategy
+- List every condition in conditions_met or conditions_failed (not both)
+- When fired=true: compute entry/SL/TP exactly using the formulas in the strategy definition
+- confidence: 0.9+ = all conditions clearly met with margin; 0.7-0.9 = met but some borderline; below 0.7 = should not fire
+- market_regime: assess from EMA alignment and ADX (bull_trend = EMA20>EMA50>EMA200 and ADX>20; bear_trend = inverse; ranging = ADX<20; uncertain = mixed signals)
+- rationale: 2-3 sentences explaining the key factors for your decision"""
+
+    # Tool schema — Claude fills only market_regime and signals
+    class _SignalSchema(BaseModel):
+        strategy_id: str
+        fired: bool
+        direction: Optional[Literal["long", "short"]] = None
+        entry_low: float | None = None
+        entry_high: float | None = None
+        stop_loss: float | None = None
+        tp1: float | None = None
+        tp2: float | None = None
+        rr: float | None = None
+        confidence: float | None = None
+        rationale: str = ""
+        conditions_met: list[str] = []
+        conditions_failed: list[str] = []
+
+    class _ScanSchema(BaseModel):
+        market_regime: Literal["bull_trend", "bear_trend", "ranging", "uncertain"]
+        signals: list[_SignalSchema]
+
+    tool_def = {
+        "name": "record_strategy_scan",
+        "description": "Record the complete strategy signal evaluation for this asset.",
+        "input_schema": _ScanSchema.model_json_schema(),
+    }
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=4000,
+        system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+        tools=[tool_def],
+        tool_choice={"type": "tool", "name": "record_strategy_scan"},
+        extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+
+    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if not tool_block:
+        raise RuntimeError("Claude did not return a record_strategy_scan tool_use block")
+
+    raw = tool_block.input
+    return StrategyScannerOutput(
+        asset_id=asset_id,
+        ticker=ticker,
+        label=label,
+        current_price=md["price"],
+        atr=md["atr"],
+        rsi=md["rsi"],
+        analysis_date=md["date"],
+        market_regime=raw["market_regime"],
+        signals=[StrategySignal(**s) for s in raw["signals"]],
+    )

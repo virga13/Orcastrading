@@ -129,3 +129,9 @@ class RunStats(BaseModel):
 
     walk_forward: list[WalkForwardWindow] = []
     kelly_25pct: float = 0.0
+
+    # Risk-adjusted performance metrics
+    calmar_ratio: float = 0.0           # total_net_R / abs(max_drawdown_R) — higher is better
+    max_drawdown_duration: int = 0      # consecutive filled trades spent in drawdown
+    max_win_streak: int = 0             # longest consecutive winning streak
+    max_loss_streak: int = 0            # longest consecutive losing streak
