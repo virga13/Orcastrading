@@ -99,7 +99,7 @@ def cmd_scan(args) -> None:
                  if args.strategy in get_enabled_strategies(a["id"])]
     else:
         from core.config import get_watchlist
-        pairs = get_watchlist()
+        pairs = get_watchlist()  # list of (asset_id, strategy_id, timeframe)
 
     ch = configured_channels()
     ch_str = ", ".join(ch) if ch else "none — run alert-test to configure"
@@ -108,9 +108,11 @@ def cmd_scan(args) -> None:
         f"as of {as_of or date.today()}  |  alerts: {ch_str}[/dim]\n"
     )
 
-    for asset_id, strategy_id in pairs:
+    for entry in pairs:
+        asset_id, strategy_id = entry[0], entry[1]
+        timeframe = entry[2] if len(entry) > 2 else None
         try:
-            result = scan_strategy(asset_id, strategy_id, as_of=as_of)
+            result = scan_strategy(asset_id, strategy_id, timeframe=timeframe, as_of=as_of)
         except Exception as e:
             console.print(f"[red]Error ({asset_id}/{strategy_id}):[/red] {e}\n")
             continue
@@ -317,11 +319,11 @@ def cmd_daily(args) -> None:
     console.rule("[dim]Signal Scan[/dim]")
     pairs   = get_watchlist()
     results = []
-    for asset_id, strategy_id in pairs:
+    for asset_id, strategy_id, timeframe in pairs:
         try:
-            result = scan_strategy(asset_id, strategy_id)
+            result = scan_strategy(asset_id, strategy_id, timeframe=timeframe)
         except Exception as e:
-            console.print(f"[red]Error ({asset_id}/{strategy_id}):[/red] {e}\n")
+            console.print(f"[red]Error ({asset_id}/{strategy_id}/{timeframe}):[/red] {e}\n")
             continue
         results.append(result)
         _display_result(result, no_record=False)

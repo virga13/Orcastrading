@@ -246,7 +246,15 @@ class MTFTrendStrategy(StrategyBase):
             return None
 
         # ── Gate 1 + 2: HTF bias and ADX ─────────────────────────────────────
-        htf_bias, htf_adx, htf_ema_f, htf_ema_s = self._htf_bias(df, interval)
+        # Use precomputed values when available (optimizer precomputes once per bar
+        # since these are param-independent, giving ~50× speedup on grid search).
+        if "htf_bias" in tech:
+            htf_bias  = tech["htf_bias"]
+            htf_adx   = tech["htf_adx"]
+            htf_ema_f = tech["htf_ema_f"]
+            htf_ema_s_val = tech["htf_ema_s"]
+        else:
+            htf_bias, htf_adx, htf_ema_f, htf_ema_s_val = self._htf_bias(df, interval)
         if htf_bias is None:
             return None
 
@@ -263,8 +271,11 @@ class MTFTrendStrategy(StrategyBase):
         # ── Gate 6: Regime filter (SMA200) ───────────────────────────────────
         # Applied before computing ETF indicators to fail fast.
         regime = "neutral"
-        if self.regime_filter:
+        if "regime" in tech:
+            regime = tech["regime"]
+        elif self.regime_filter:
             regime = classify_regime(df, interval)
+        if self.regime_filter:
             if regime == "bear_trend" and htf_bias == "long":
                 return None   # never buy into a confirmed bear market
             if regime == "bull_trend" and htf_bias == "short":
@@ -275,8 +286,14 @@ class MTFTrendStrategy(StrategyBase):
         if len(close) < self.ema_fast + 5:
             return None
 
-        etf_ema_s = ta.trend.EMAIndicator(close, window=self.ema_fast).ema_indicator()
-        etf_ema_val = float(etf_ema_s.iloc[-1])
+        if "etf_ema_val" in tech and "etf_ema_tail" in tech:
+            etf_ema_val  = tech["etf_ema_val"]
+            etf_ema_tail = tech["etf_ema_tail"]  # list, [-1]=current, [-j]=j bars ago
+            etf_ema_s    = None  # won't use series path
+        else:
+            etf_ema_s    = ta.trend.EMAIndicator(close, window=self.ema_fast).ema_indicator()
+            etf_ema_val  = float(etf_ema_s.iloc[-1])
+            etf_ema_tail = None
         if pd.isna(etf_ema_val):
             return None
 
@@ -287,13 +304,12 @@ class MTFTrendStrategy(StrategyBase):
         if abs(dist_atr) > self.pullback_max_atr:
             return None
 
-        # Must be on the correct side — long bias needs price at or slightly above EMA.
-        # Allow up to 0.8 ATR overshoot: volatile assets and lower timeframes (1h, 15m)
-        # frequently undershoot the EMA before bouncing. 0.5 was too tight and cut
-        # valid entries on crypto and gold 1h setups.
-        if htf_bias == "long"  and dist_pts < -0.8 * atr:
+        # Must be on the correct side — long bias needs price at or above EMA.
+        # Allow up to 0.5 ATR on the wrong side: volatile assets often overshoot
+        # the EMA briefly before reversing. Beyond 0.5 ATR signals a trend break.
+        if htf_bias == "long"  and dist_pts < -0.5 * atr:
             return None
-        if htf_bias == "short" and dist_pts >  0.8 * atr:
+        if htf_bias == "short" and dist_pts >  0.5 * atr:
             return None
 
         # ── Gate 4: Prior distance — directional (v1 bug fix) ────────────────
@@ -304,9 +320,14 @@ class MTFTrendStrategy(StrategyBase):
         #        confirms the rally that is now fading was real.
         prior_valid = False
         for j in range(2, self.prior_lookback + 2):
-            if len(etf_ema_s) < j or len(close) < j:
-                break
-            p_ema   = float(etf_ema_s.iloc[-j])
+            if etf_ema_tail is not None:
+                if j > len(etf_ema_tail) or len(close) < j:
+                    break
+                p_ema = etf_ema_tail[-j]
+            else:
+                if len(etf_ema_s) < j or len(close) < j:
+                    break
+                p_ema = float(etf_ema_s.iloc[-j])
             p_price = float(close.iloc[-j])
             if htf_bias == "long":
                 # Prior bar was clearly ABOVE EMA (directional, not abs)
@@ -396,7 +417,7 @@ class MTFTrendStrategy(StrategyBase):
             rationale=(
                 f"HTF ({htf_label}) EMA{self.ema_fast}({htf_ema_f:,.2f}) "
                 f"{'>' if htf_bias=='long' else '<'} "
-                f"EMA{self.ema_slow}({htf_ema_s:,.2f}) "
+                f"EMA{self.ema_slow}({htf_ema_s_val:,.2f}) "
                 f"-> {htf_bias} bias (ADX {htf_adx:.0f}). "
                 f"Price retesting ETF EMA{self.ema_fast} at {etf_ema_val:,.4f} ({dist_atr:+.2f} ATR). "
                 f"RSI {rsi:.0f} confirms momentum. "

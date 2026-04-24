@@ -17,28 +17,41 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from functools import lru_cache
 from typing import Any
 
 import yaml
 
 _CONFIG_DIR = Path(__file__).parent.parent / "config"
 
+# ── mtime-aware YAML cache ────────────────────────────────────────────────────
+# Each entry: path_str → (data, mtime_float).
+# Re-reads from disk only when the file's mtime changes — zero overhead on
+# hot paths, instant pickup of edits without restarting the process.
 
-# ── Raw loaders (cached) ──────────────────────────────────────────────────────
+_yaml_cache: dict[str, tuple[Any, float]] = {}
 
-@lru_cache(maxsize=1)
+
+def _load_yaml(path: Path) -> Any:
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    key   = str(path)
+    entry = _yaml_cache.get(key)
+    if entry is not None and entry[1] == mtime:
+        return entry[0]
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    _yaml_cache[key] = (data, mtime)
+    return data
+
+
 def _load_assets() -> dict:
-    path = _CONFIG_DIR / "assets.yaml"
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    return _load_yaml(_CONFIG_DIR / "assets.yaml")
 
 
-@lru_cache(maxsize=1)
 def _load_strategies() -> dict:
-    path = _CONFIG_DIR / "strategies.yaml"
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    return _load_yaml(_CONFIG_DIR / "strategies.yaml")
 
 
 # ── Asset API ─────────────────────────────────────────────────────────────────
@@ -88,7 +101,41 @@ def get_ticker(asset_id: str, source: str | None = None) -> str:
 def get_enabled_strategies(asset_id: str) -> list[str]:
     """Return the list of strategy IDs enabled for an asset."""
     asset = get_asset(asset_id)
-    return asset.get("strategies", [])
+    strats = asset.get("strategies", [])
+    return [s if isinstance(s, str) else s["id"] for s in strats]
+
+
+def get_strategy_timeframes(asset_id: str, strategy_id: str) -> list[str]:
+    """
+    Return the timeframes configured for a strategy on a specific asset.
+    Falls back to the strategy's default_timeframe if not explicitly configured.
+    """
+    asset = get_asset(asset_id)
+    for entry in asset.get("strategies", []):
+        if isinstance(entry, str):
+            if entry == strategy_id:
+                return [get_strategy_timeframe(strategy_id)]
+        elif entry.get("id") == strategy_id:
+            return entry.get("timeframes", [get_strategy_timeframe(strategy_id)])
+    return [get_strategy_timeframe(strategy_id)]
+
+
+def get_asset_strategy_params(asset_id: str, strategy_id: str) -> dict:
+    """
+    Return per-asset param overrides for a strategy, or {} if none defined.
+    Asset entries may specify a 'params' dict that overrides the strategy defaults.
+
+    Example in assets.yaml:
+        strategies:
+          - id: mtf_trend
+            params:
+              shorts_enabled: false
+    """
+    asset = get_asset(asset_id)
+    for entry in asset.get("strategies", []):
+        if isinstance(entry, dict) and entry.get("id") == strategy_id:
+            return entry.get("params", {})
+    return {}
 
 
 def get_session(asset_id: str) -> dict:
@@ -99,6 +146,32 @@ def get_session(asset_id: str) -> dict:
 def get_orb_config(asset_id: str) -> dict | None:
     """Return the ORB session config for an asset, or None if not configured."""
     return get_asset(asset_id).get("orb")
+
+
+def get_asset_baseline(asset_id: str) -> dict | None:
+    """
+    Return the validated backtest baseline for an asset, or None if not set.
+    Keys: win_rate, net_pf, avg_net_pnl_r, max_drawdown_r, kelly_25pct, n_trades, period.
+    Set in config/assets.yaml under 'baseline:' — only edit after re-running walk-forward validation.
+    """
+    try:
+        return get_asset(asset_id).get("baseline") or None
+    except KeyError:
+        return None
+
+
+def get_asset_map() -> dict[str, dict]:
+    """
+    Return a dict keyed by yfinance ticker, value is the full asset dict.
+    Used by scanner and report modules as a fast lookup.
+    Only includes assets that have a yfinance ticker configured.
+    """
+    result = {}
+    for a in get_all_assets():
+        yf = a.get("tickers", {}).get("yfinance")
+        if yf:
+            result[yf] = a
+    return result
 
 
 # ── Strategy API ──────────────────────────────────────────────────────────────
@@ -125,7 +198,7 @@ def get_strategy_params(strategy_id: str) -> dict:
 
 def get_strategy_timeframe(strategy_id: str) -> str:
     """Return the primary timeframe for a strategy (e.g. '1d', '15m')."""
-    return get_strategy_config(strategy_id).get("timeframe", "1d")
+    return get_strategy_config(strategy_id).get("default_timeframe", "1d")
 
 
 def get_strategy_lookback(strategy_id: str) -> int:
@@ -135,19 +208,28 @@ def get_strategy_lookback(strategy_id: str) -> int:
 
 # ── Convenience: all (asset_id, strategy_id) pairs that are enabled ──────────
 
-def get_watchlist() -> list[tuple[str, str]]:
+def get_watchlist() -> list[tuple[str, str, str]]:
     """
-    Return all (asset_id, strategy_id) pairs that are currently enabled.
-    Used by the scanner to know what to run each day.
+    Return all (asset_id, strategy_id, timeframe) triples that are currently enabled.
+    Assets with enabled=false are skipped. Defaults to enabled if key absent.
+    Each strategy entry may be a plain string (uses default_timeframe) or a dict
+    with 'id' and 'timeframes' keys (expanded to one triple per timeframe).
     """
-    pairs = []
+    triples = []
     for asset in get_all_assets():
-        for strategy_id in asset.get("strategies", []):
-            pairs.append((asset["id"], strategy_id))
-    return pairs
+        if not asset.get("enabled", True):
+            continue
+        for entry in asset.get("strategies", []):
+            if isinstance(entry, str):
+                strategy_id = entry
+                triples.append((asset["id"], strategy_id, get_strategy_timeframe(strategy_id)))
+            else:
+                strategy_id = entry["id"]
+                for tf in entry.get("timeframes", [get_strategy_timeframe(strategy_id)]):
+                    triples.append((asset["id"], strategy_id, tf))
+    return triples
 
 
 def reload():
-    """Force reload of all config files (clears lru_cache). Useful in long-running processes."""
-    _load_assets.cache_clear()
-    _load_strategies.cache_clear()
+    """Force reload of all config files (clears mtime cache). Useful in tests."""
+    _yaml_cache.clear()

@@ -1,12 +1,13 @@
 """
 core/data.py — Provider-agnostic data fetcher.
 
-Wraps p3_backtester.market_data.fetch_ohlcv and adds support for EODHD.
+Wraps p3_backtester.market_data.fetch_ohlcv and adds support for EODHD and Twelve Data.
 The active provider is selected via the DATA_PROVIDER environment variable:
 
-    DATA_PROVIDER=yfinance   (default — free, limited intraday history)
-    DATA_PROVIDER=eodhd      (recommended for intraday — requires EODHD_API_KEY)
-    DATA_PROVIDER=ccxt       (crypto only)
+    DATA_PROVIDER=yfinance    (default — free, limited intraday history)
+    DATA_PROVIDER=eodhd       (recommended for intraday — requires EODHD_API_KEY)
+    DATA_PROVIDER=twelvedata  (recommended for Gold/Silver/Forex — requires TWELVEDATA_API_KEY)
+    DATA_PROVIDER=ccxt        (crypto only)
 
 Usage:
     from core.data import fetch
@@ -52,12 +53,20 @@ def fetch(
     provider = (source or os.getenv("DATA_PROVIDER", "yfinance")).lower()
     ticker   = get_ticker(asset_id, source=provider)
 
+    if provider == "twelvedata":
+        try:
+            return _fetch_twelvedata(ticker, timeframe, start_date, end_date)
+        except RuntimeError as e:
+            import warnings
+            warnings.warn(
+                f"Twelve Data fetch failed ({e}), falling back to yfinance.",
+                stacklevel=2,
+            )
+
     if provider == "eodhd":
         try:
             return _fetch_eodhd(ticker, timeframe, start_date, end_date)
         except RuntimeError as e:
-            # Graceful fallback: EODHD failed (403 = plan limitation, 404 = bad ticker).
-            # Fall through to yfinance so scanning still works while on free plan.
             import warnings
             warnings.warn(
                 f"EODHD fetch failed ({e}), falling back to yfinance. "
@@ -65,9 +74,11 @@ def fetch(
                 stacklevel=2,
             )
 
-    # Default — delegate to the existing multi-source fetcher
+    # Default — delegate to the existing multi-source fetcher.
+    # Use the yfinance ticker specifically so XAU/USD doesn't get passed to yfinance.
+    yf_ticker = get_ticker(asset_id, source="yfinance")
     from p3_backtester.market_data import fetch_ohlcv
-    return fetch_ohlcv(ticker, timeframe, start_date, end_date, source="auto")
+    return fetch_ohlcv(yf_ticker, timeframe, start_date, end_date, source="auto")
 
 
 def fetch_with_warmup(
@@ -88,6 +99,132 @@ def fetch_with_warmup(
     from core.config import get_strategy_timeframe
     timeframe = get_strategy_timeframe(strategy_id)
     return fetch(asset_id, timeframe, warmup_start, end_date, source=source)
+
+
+# ── Twelve Data provider ─────────────────────────────────────────────────────
+
+_TD_INTERVAL_MAP = {
+    "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
+    "1h": "1h", "4h": "4h", "8h": "8h", "1d": "1day", "1wk": "1week",
+}
+
+
+def _fetch_twelvedata(ticker: str, interval: str, start: str, end: str) -> pd.DataFrame:
+    """
+    Fetch OHLCV from Twelve Data REST API.
+    Requires TWELVEDATA_API_KEY environment variable.
+    Free tier: 800 credits/day, 8 credits/min.
+    Docs: https://twelvedata.com/docs
+    """
+    import urllib.request, json as _json
+
+    api_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "TWELVEDATA_API_KEY not set. Add it to your .env file.\n"
+            "Get a free key at https://twelvedata.com/"
+        )
+
+    td_interval = _TD_INTERVAL_MAP.get(interval)
+    if not td_interval:
+        raise ValueError(f"Twelve Data: unsupported interval '{interval}'")
+
+    # Calculate outputsize from date range
+    from datetime import datetime as _dt
+    days = (_dt.strptime(end, "%Y-%m-%d") - _dt.strptime(start, "%Y-%m-%d")).days
+    # For intraday, outputsize needs more bars per day
+    bars_per_day = {"1min": 390, "5min": 78, "15min": 26, "30min": 13,
+                    "1h": 7, "4h": 2, "8h": 3, "1day": 1, "1week": 1}
+    outputsize = min(5000, max(30, days * bars_per_day.get(td_interval, 1) + 10))
+
+    url = (
+        f"https://api.twelvedata.com/time_series"
+        f"?symbol={urllib.request.quote(ticker, safe='/')}"
+        f"&interval={td_interval}&outputsize={outputsize}"
+        f"&start_date={start}&end_date={end}"
+        f"&apikey={api_key}&format=JSON"
+    )
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = _json.loads(resp.read())
+    except Exception as e:
+        raise RuntimeError(f"Twelve Data fetch failed for {ticker}: {e}")
+
+    if data.get("status") == "error":
+        raise RuntimeError(f"Twelve Data error for {ticker}: {data.get('message', data)}")
+
+    values = data.get("values", [])
+    if not values:
+        raise RuntimeError(f"Twelve Data returned empty data for {ticker} {interval}")
+
+    df = pd.DataFrame(values)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.set_index("datetime").sort_index()
+    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low",
+                             "close": "Close", "volume": "Volume"})
+    for col in ["Open", "High", "Low", "Close"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "Volume" in df.columns:
+        df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
+    else:
+        df["Volume"] = 0
+    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+    df = df[df["Close"] > 0]
+    return df
+
+
+def fetch_twelvedata_quotes(symbols: list[str], api_key: str) -> dict:
+    """
+    Fetch real-time quotes + historical close prices for Market Pulse.
+    Uses Twelve Data /time_series for each symbol (daily, 70 bars).
+    Returns dict: {symbol: {"price": float, "1W%": float, "1M%": float, "3M%": float}}
+
+    Only call this for symbols confirmed on the free tier (forex/crypto pairs like XAU/USD).
+    """
+    import urllib.request, json as _json, time as _time
+
+    _HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
+
+    results = {}
+    for symbol in symbols:
+        try:
+            url = (
+                f"https://api.twelvedata.com/time_series"
+                f"?symbol={urllib.request.quote(symbol, safe='/')}"
+                f"&interval=1day&outputsize=70&apikey={api_key}&format=JSON"
+            )
+            req = urllib.request.Request(url, headers=_HEADERS)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = _json.loads(resp.read())
+            if data.get("status") == "error":
+                results[symbol] = {"error": data.get("message", "API error")}
+                continue
+            values = data.get("values", [])
+            if len(values) < 5:
+                results[symbol] = {"error": "insufficient data"}
+                continue
+            closes = [float(v["close"]) for v in values]  # newest first
+            price = closes[0]
+            def _pct(n, _c=closes, _p=price):
+                return (_p - _c[n]) / _c[n] * 100 if len(_c) > n else None
+            results[symbol] = {
+                "price": price,
+                "1W%": _pct(5),
+                "1M%": _pct(21),
+                "3M%": _pct(63),
+            }
+            _time.sleep(0.15)  # stay under 8 credits/min on free tier
+        except Exception as e:
+            results[symbol] = {"error": str(e)}
+    return results
 
 
 # ── EODHD provider ────────────────────────────────────────────────────────────
@@ -195,7 +332,7 @@ def active_provider() -> str:
 def provider_supports_intraday(provider: str | None = None) -> bool:
     """
     Return True if the active provider has meaningful intraday history.
-    yfinance is limited to ~60 days of 15-min data; eodhd has years.
+    yfinance is limited to ~60 days of 15-min data; eodhd/twelvedata have years.
     """
     p = (provider or active_provider()).lower()
-    return p in ("eodhd", "ccxt")
+    return p in ("eodhd", "ccxt", "twelvedata")

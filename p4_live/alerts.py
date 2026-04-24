@@ -24,15 +24,19 @@ from datetime import datetime, timezone
 
 # ── Formatting helpers ────────────────────────────────────────────────────────
 
-def _fmt_signal(result: dict) -> tuple[str, str]:
+def _fmt_signal(
+    result: dict,
+    open_positions: list[str] | None = None,
+    vix_level: float | None = None,
+) -> tuple[str, str]:
     """Return (subject, body) for a signal-fired alert."""
     from p4_live.risk import position_sizing
     r        = result
     strategy = r.get("strategy", "mtf_trend").upper().replace("_", " ")
     subject  = f"[ORCA] {strategy} — {r['label']} {r['direction'].upper()} {r['signal_date']}"
 
-    # Position sizing block
-    sizing   = position_sizing(r)
+    # Position sizing block — pass open positions and VIX so correlation/VIX adjustments apply
+    sizing   = position_sizing(r, open_positions=open_positions, vix_level=vix_level)
     pt_risk  = f"{sizing['point_risk']:,.2f} pts" if sizing["point_risk"] else "N/A"
     sz_lines = [f"Point risk : {pt_risk}  (entry_high - stop_loss)"]
     sz_lines.append(f"Kelly (25%): {sizing['kelly_pct']:.1%}  |  Suggested: {sizing['suggested_pct']:.1%}")
@@ -221,9 +225,13 @@ def send(subject: str, body: str) -> dict[str, bool]:
     return results
 
 
-def alert_signal(result: dict) -> None:
-    """Send a signal-fired alert."""
-    subject, body = _fmt_signal(result)
+def alert_signal(
+    result: dict,
+    open_positions: list[str] | None = None,
+    vix_level: float | None = None,
+) -> None:
+    """Send a signal-fired alert. Pass open_positions and vix_level for accurate sizing."""
+    subject, body = _fmt_signal(result, open_positions=open_positions, vix_level=vix_level)
     sent = send(subject, body)
     _log_sent(sent, result["label"])
 
@@ -252,14 +260,15 @@ def alert_startup(strategies: list[str], assets: list[str]) -> None:
         Active strategies: {', '.join(strategies)}
 
         Intraday scan (ORB): every 15 min during market hours
-        Daily scan (MTF Trend, Momentum): after market close (22:00)
+        Morning scan (1d): 09:00 — catches US bar closed after 22:00 scan
+        Daily scan (MTF Trend, Momentum): 22:00 — maintenance + report
 
         Started at {ts}
     """).strip()
     send(subject, body)
 
 
-def alert_daily_summary(results: list[dict]) -> None:
+def alert_daily_summary(results: list[dict], total_pairs: int | None = None) -> None:
     """Send end-of-day summary even when no signals fire."""
     ts      = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     fired   = [r for r in results if r.get("fired")]
@@ -276,13 +285,14 @@ def alert_daily_summary(results: list[dict]) -> None:
     else:
         signals_text = "  No signals across all assets and strategies."
 
+    pairs_str = str(total_pairs) if total_pairs is not None else "?"
     body = textwrap.dedent(f"""
         Daily scan complete — {ts}
 
         Signals fired ({len(fired)}):
 {signals_text}
 
-        Scanned {len(results)} asset/strategy pairs.
+        Scanned {pairs_str} asset/strategy pairs.
     """).strip()
     send(subject, body)
 

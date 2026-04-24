@@ -33,6 +33,7 @@ _YF_LOOKBACK: dict[str, int] = {
     "15m": 58,
     "30m": 58,
     "1h":  729,
+    "4h":  729,
     "1d":  10000,
     "1wk": 50000,
 }
@@ -44,6 +45,7 @@ _BARS_PER_DAY: dict[str, float] = {
     "15m": 26,
     "30m": 13,
     "1h":  6.5,
+    "4h":  1.625,  # ~6.5 / 4
     "1d":  0.69,   # ~252 trading days / 365 calendar days
     "1wk": 0.14,   # ~52 weeks / 365 calendar days
 }
@@ -197,12 +199,12 @@ def _compute_fetch_range(ticker: str, interval: str, start_date: str, end_date: 
     fetch_start = (start_dt - timedelta(days=warmup_days)).strftime("%Y-%m-%d")
     fetch_end   = end_dt.strftime("%Y-%m-%d")
 
-    # yfinance 1H limit check
-    if interval == "1h":
-        max_days = _YF_LOOKBACK.get("1h", 729)
+    # yfinance intraday limit check (1h cap at 729 days, 4h at 729 days too)
+    _YF_INTRADAY = {"1h": 729, "4h": 729, "30m": 58, "15m": 58, "5m": 58, "1m": 6}
+    if interval in _YF_INTRADAY:
+        max_days = _YF_INTRADAY[interval]
         total_days = (end_dt - datetime.strptime(fetch_start, "%Y-%m-%d")).days
         if total_days > max_days:
-            # Trim fetch_start to fit within limit
             fetch_start = (end_dt - timedelta(days=max_days - 1)).strftime("%Y-%m-%d")
 
     return fetch_start, fetch_end

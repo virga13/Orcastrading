@@ -280,6 +280,7 @@ def backfill(
                     exit_price=result["exit_price"],
                     exit_date=result["exit_date"],
                     pnl_r=result["pnl_r"],
+                    strategy="mtf_trend",
                 )
                 fills += 1
                 # Lock out until this trade's exit bar

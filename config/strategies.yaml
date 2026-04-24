@@ -1,84 +1,93 @@
-# Orcastrading — Strategy Parameter Defaults
-#
-# These are the default parameters used when a strategy is instantiated without
-# explicit overrides. Override per-asset in assets.yaml or via the UI/CLI.
-#
-# class: importable path to the strategy class
-# timeframe: interval this strategy uses for its primary data feed
-# lookback_days: calendar days of history needed for warmup
-
 strategies:
-
   mtf_trend:
-    name: "MTF Trend"
-    description: "Multi-timeframe EMA pullback — HTF bias + LTF EMA retest + regime filter"
-    default_timeframe: "1d"
-    supported_timeframes: ["1h", "4h", "1d", "1wk"]
+    name: MTF Trend
+    description: Multi-timeframe EMA pullback — HTF bias + LTF EMA retest + regime
+      filter
+    default_timeframe: 1d
+    supported_timeframes:
+    - 1h
+    - 4h
+    - 1d
+    - 1wk
     lookback_days: 400
     expiry_days: 5
-    class: "p3_backtester.strategies.mtf_trend.MTFTrendStrategy"
-    signal_conditions: |
-      LONG signal fires when ALL of the following conditions are met:
-      1. Weekly trend: weekly EMA20 > weekly EMA50
-      2. Daily trend: daily EMA20 > daily EMA50
-      3. Price pullback to EMA20: |price - EMA20| / ATR <= pullback_max_atr
-      4. Prior distance: price was >= min_prior_distance_atr ATR from EMA20 in last N bars
-      5. RSI(14) <= rsi_max (not overbought)
-      6. ADX(14) >= adx_threshold (trend has minimum strength)
-      7. Regime: SMA200 slope is bullish (blocks longs in bear markets)
-
-      SHORT signal: mirrors long with reversed conditions.
-
-      Entry/exit (long):
-        entry_low  = EMA20 - (0.3 × ATR)
-        entry_high = EMA20 + (0.5 × ATR)
-        stop_loss  = N-bar swing low - (sl_buffer_atr × ATR)
-        risk       = entry_high - stop_loss
-        tp1        = entry_high + (tp1_r × risk)
-        tp2        = entry_high + (tp2_r × risk)
+    class: p3_backtester.strategies.mtf_trend.MTFTrendStrategy
+    signal_conditions: "LONG signal fires when ALL of the following conditions are\
+      \ met:\n1. Weekly trend: weekly EMA20 > weekly EMA50\n2. Daily trend: daily\
+      \ EMA20 > daily EMA50\n3. Price pullback to EMA20: |price - EMA20| / ATR <=\
+      \ pullback_max_atr\n4. Prior distance: price was >= min_prior_distance_atr ATR\
+      \ from EMA20 in last N bars\n5. RSI(14) <= rsi_max (not overbought)\n6. ADX(14)\
+      \ >= adx_threshold (trend has minimum strength)\n7. Regime: SMA200 slope is\
+      \ bullish (blocks longs in bear markets)\n\nSHORT signal: mirrors long with\
+      \ reversed conditions.\n\nEntry/exit (long):\n  entry_low  = EMA20 - (0.3 ×\
+      \ ATR)\n  entry_high = EMA20 + (0.5 × ATR)\n  stop_loss  = N-bar swing low -\
+      \ (sl_buffer_atr × ATR)\n  risk       = entry_high - stop_loss\n  tp1      \
+      \  = entry_high + (tp1_r × risk)\n  tp2        = entry_high + (tp2_r × risk)\n"
+    # Optimized 2026-04-20 — grid search GC=F/^DJI/^GSPC 2019-2026, 1296 combos
+    # All 3 assets agree: tp2_r=6.0, tp1_alloc=60, shorts_enabled=False (global default)
+    # adx_threshold raised 15→22: current too loose, fires in sideways markets
+    # tp2_r raised 4.0→6.0: biggest change — MTF Trend setups have long follow-through
+    # tp1_r raised 2.5→3.0 (consensus Gold+S&P; US30 prefers 2.0 — use per-asset override)
+    # Per-asset overrides for pullback_max_atr and adx_threshold in assets.yaml
     params:
       ema_fast: 20
       ema_slow: 50
-      adx_threshold: 20
-      adx_threshold_short: 15
-      pullback_max_atr: 1.2
-      min_prior_distance_atr: 1.5
-      prior_lookback: 5
-      rsi_max: 65
-      rsi_min: 35
+      adx_threshold: 22
+      adx_threshold_short: 10
+      pullback_max_atr: 1.5
+      min_prior_distance_atr: 0.8
+      prior_lookback: 10
+      rsi_max: 70
+      rsi_min: 30
       sl_buffer_atr: 0.15
       sl_lookback: 15
-      tp1_r: 2.5
-      tp2_r: 4.0
-      tp1_alloc: 70
-      tp2_alloc: 30
-      win_rate: 0.48
+      tp1_r: 3.0
+      tp2_r: 6.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      win_rate: 0.50
       regime_filter: true
-      shorts_enabled: true
-
+      shorts_enabled: false
   orb:
-    name: "Opening Range Breakout"
-    description: "Breakout above/below the opening range — timeframe-agnostic (range defined in minutes)"
-    default_timeframe: "15m"
-    supported_timeframes: ["1m", "5m", "15m", "30m", "1h"]
+    name: Opening Range Breakout
+    description: Breakout above/below the opening range — timeframe-agnostic (range
+      defined in minutes)
+    default_timeframe: 15m
+    supported_timeframes:
+    - 1m
+    - 5m
+    - 15m
+    - 30m
+    - 1h
     lookback_days: 5
     expiry_days: 1
-    class: "p3_backtester.strategies.orb.ORBStrategy"
-    signal_conditions: |
-      LONG signal fires when ALL of the following conditions are met:
+    class: p3_backtester.strategies.orb.ORBStrategy
+    signal_conditions: 'LONG signal fires when ALL of the following conditions are
+      met:
+
       1. Bar closes above opening range high
+
       2. Bar volume >= volume_multiplier × avg opening-range bar volume
+
       3. Bar close > session VWAP (if require_vwap_filter=true)
+
       4. Bar body >= body_pct_min × total bar size (conviction close)
+
       5. Within trade_window_bars bars after opening range ends
+
       6. Range size in [range_min_atr_factor, range_max_atr_factor] × daily ATR
+
       7. RSI <= rsi_max_long
+
       8. Daily EMA20 > EMA50 (if daily_trend_filter=true)
 
+
       Session is skipped if overnight gap > max_gap_pct.
+
+      '
     params:
-      opening_range_minutes: 30   # duration of opening range in minutes (auto-converts to bars)
-      trade_window_minutes: 90    # how long after opening range to scan for breakout
+      opening_range_minutes: 30
+      trade_window_minutes: 90
       volume_multiplier: 1.5
       range_min_atr_factor: 0.3
       range_max_atr_factor: 2.5
@@ -95,104 +104,123 @@ strategies:
       short_enabled: true
       require_vwap_filter: true
       daily_trend_filter: true
-
   momentum_breakout:
-    name: "Momentum Breakout"
-    description: "N-period high breakout with volume expansion and HTF bias — any timeframe"
-    default_timeframe: "1d"
-    supported_timeframes: ["1h", "4h", "1d", "1wk"]
+    name: Momentum Breakout
+    description: N-period high breakout with volume expansion and HTF bias — any timeframe
+    default_timeframe: 1d
+    supported_timeframes:
+    - 1h
+    - 4h
+    - 1d
+    - 1wk
     lookback_days: 60
     expiry_days: 3
-    class: "p3_backtester.strategies.momentum_breakout.MomentumBreakoutStrategy"
-    signal_conditions: |
-      LONG signal fires when ALL of the following conditions are met:
-      1. Today's close > 20-day high (breakout on daily close)
-      2. Today's volume >= volume_multiplier × 20-day avg volume
-      3. (close - low) / (high - low) >= 1 - close_top_pct  (conviction close)
-      4. Yesterday's ADX(14) < adx_max_before  (was consolidating, now breaking out)
-      5. RSI(14) in [rsi_min, rsi_max]  (momentum confirmed, not overbought)
-      6. Weekly EMA20 > weekly EMA50  (higher timeframe aligned)
-
-      Entry/exit (long):
-        consolidation_height = 20-day high - 20-day low
-        entry_low  = today's close
-        entry_high = today's close + (0.2 × ATR)
-        stop_loss  = 20-day low
-        tp1        = entry_high + consolidation_height
-        tp2        = entry_high + (2 × consolidation_height)
+    class: p3_backtester.strategies.momentum_breakout.MomentumBreakoutStrategy
+    signal_conditions: "LONG signal fires when ALL of the following conditions are\
+      \ met:\n1. Close > N-period high (breakout on bar close)\n2. Bar volume >=\
+      \ volume_multiplier × N-period avg volume\n3. (close - low) / (high - low) >=\
+      \ 1 - close_top_pct  (conviction close, not a wick)\n4. Previous bar ADX(14)\
+      \ < adx_max_before  (was in consolidation, not already trending)\n5. RSI(14)\
+      \ in [rsi_min, rsi_max]  (momentum building, not overbought)\n6. HTF EMA20\
+      \ > EMA50  (higher timeframe trend aligned)\n\nEntry/exit:\n  entry_low  =\
+      \ entry_high = breakout close  (market entry on next open)\n  stop_loss  =\
+      \ N-period low  (below full consolidation range)\n  consolidation_range = N-period\
+      \ high - N-period low\n  tp1 = entry + 1 × consolidation_range  (measured move)\n\
+      \  tp2 = entry + 2 × consolidation_range\n  Risk guard: skipped if SL is >\
+      \ 20% from entry (range too wide)\n\nNote: TPs are computed from consolidation\
+      \ range (measured move), not fixed R multiples.\n"
+    # Parameters relaxed from original defaults to fire on trending assets like Gold.
+    # Original adx_max_before=25 / volume_multiplier=1.5 / rsi 50-70 produced 0 signals
+    # on Gold 2024-2026 because Gold's ADX routinely stays above 25 in a bull trend.
+    # Run run_ema_optimization.py equivalent against this strategy before trusting live results.
     params:
-      lookback_periods: 20    # N-period high lookback (was lookback_days — now interval-agnostic)
-      volume_multiplier: 1.5
-      close_top_pct: 0.25
-      adx_max_before: 25
-      rsi_min: 50
-      rsi_max: 70
+      lookback_periods: 20
+      volume_multiplier: 1.2   # relaxed from 1.5 — futures volume is noisy
+      close_top_pct: 0.25      # bar must close in top 25% of range (conviction filter)
+      adx_max_before: 32       # relaxed from 25 — Gold ADX stays elevated in strong trends
+      rsi_min: 45              # relaxed from 50 — catch breakouts earlier in momentum cycle
+      rsi_max: 75              # relaxed from 70 — allow strong-momentum breakouts
       tp1_alloc: 70
       tp2_alloc: 30
-
   ema_continuation:
-    name: "EMA Continuation"
-    description: "EMA pullback entry in a trending market — any timeframe"
-    default_timeframe: "1d"
-    supported_timeframes: ["15m", "30m", "1h", "4h", "1d"]
+    name: EMA Continuation
+    description: EMA pullback entry in a trending market — any timeframe
+    default_timeframe: 1d
+    supported_timeframes:
+    - 15m
+    - 30m
+    - 1h
+    - 4h
+    - 1d
     lookback_days: 60
     expiry_days: 3
-    class: "p3_backtester.strategies.ema_continuation.EMAContinuationStrategy"
-    signal_conditions: |
-      LONG signal fires when ALL of the following conditions are met:
-      1. ADX(14) >= adx_threshold (trend is active)
-      2. Price within pullback_max_atr × ATR of EMA (pullback has arrived)
-      3. Price was >= min_prior_distance_atr × ATR from EMA in last 5 bars (genuine pullback)
-      4. Daily close > daily EMA200 (macro regime: bull market only)
-      5. RSI(14) <= 65
-
-      Entry/exit (long):
-        entry_low  = EMA - (0.3 × ATR)
-        entry_high = EMA + (0.2 × ATR)
-        stop_loss  = EMA - (1.0 × ATR)
-        risk       = entry_high - stop_loss
-        tp1        = entry_high + (tp1_r × risk)
-        tp2        = entry_high + (tp2_r × risk)
+    class: p3_backtester.strategies.ema_continuation.EMAContinuationStrategy
+    signal_conditions: "LONG signal fires when ALL of the following conditions are\
+      \ met:\n1. ADX(14) >= adx_threshold (trend is active)\n2. Price within pullback_max_atr\
+      \ × ATR of EMA (pullback has arrived)\n3. Price was >= min_prior_distance_atr\
+      \ × ATR from EMA in last 5 bars (genuine pullback)\n4. Daily close > daily EMA200\
+      \ (macro regime: bull market only)\n5. RSI(14) <= 65\n\nEntry/exit (long):\n\
+      \  entry_low  = EMA - (0.3 × ATR)\n  entry_high = EMA + (0.2 × ATR)\n  stop_loss\
+      \  = EMA - (1.0 × ATR)\n  risk       = entry_high - stop_loss\n  tp1       \
+      \ = entry_high + (tp1_r × risk)\n  tp2        = entry_high + (tp2_r × risk)\n"
+    # Optimized 2026-04-19 — multi-asset grid search GC=F/^GSPC/BTC-USD 2018-2026
+    # Consensus: adx=22, tp1_r=3.5, tp2_r=5.0 → mean OOS PF=2.55 (210 trades)
+    # Regime learner: atr_pct_max=1.2 → ^GSPC test PF 3.31→3.62 (skip crash/expansion bars)
     params:
       ema_period: 20
-      adx_threshold: 25
-      pullback_max_atr: 1.5
-      min_prior_distance_atr: 1.5
-      rsi_max: 65
-      tp1_r: 1.5
-      tp2_r: 3.0
+      adx_threshold: 22
+      pullback_max_atr: 2.0
+      min_prior_distance_atr: 0.8
+      prior_lookback: 10
+      rsi_max: 70
+      tp1_r: 3.5
+      tp2_r: 5.0
       tp1_alloc: 60
       tp2_alloc: 40
-      win_rate: 0.50
-
+      win_rate: 0.5
+      atr_pct_max: 1.2
   ema_pullback:
-    name: "EMA Pullback"
-    description: "Deep EMA overshoot bounce at structural support — any timeframe"
-    default_timeframe: "1d"
-    supported_timeframes: ["15m", "30m", "1h", "4h", "1d"]
+    name: EMA Pullback
+    description: Deep EMA overshoot bounce at structural support — any timeframe
+    default_timeframe: 1d
+    supported_timeframes:
+    - 15m
+    - 30m
+    - 1h
+    - 4h
+    - 1d
     lookback_days: 60
     expiry_days: 3
-    class: "p3_backtester.strategies.ema_pullback.EMAPullbackStrategy"
-    signal_conditions: |
-      LONG signal fires when ALL of the following conditions are met:
-      1. Price is 0.1 – 2.5 × ATR BELOW EMA (deep pullback / overshoot)
-      2. RSI(14) < 55 (confirms pullback momentum, not reversal)
-      3. Nearest support is within 1.2 × ATR of current price
-      4. ADX(14) >= adx_threshold (minimum trend active)
-
-      Entry/exit (long):
-        entry_low  = support - (0.2 × ATR)
-        entry_high = support + (0.2 × ATR)
-        stop_loss  = support - (1.5 × ATR)
-        risk       = entry_high - stop_loss
-        tp1        = entry_high + (tp1_r × risk)
-        tp2        = entry_high + (tp2_r × risk)
+    class: p3_backtester.strategies.ema_pullback.EMAPullbackStrategy
+    signal_conditions: "LONG signal fires when ALL of the following conditions are\
+      \ met:\n1. Price is 0.1 – 2.5 × ATR BELOW EMA (deep pullback / overshoot)\n\
+      2. RSI(14) < rsi_max (confirms pullback momentum, not reversal)\n3. Nearest support\
+      \ is within 1.2 × ATR of current price\n4. ADX(14) >= adx_threshold (minimum\
+      \ trend active)\n\nEntry/exit (long):\n  entry_low  = support - (0.2 × ATR)\n\
+      \  entry_high = support + (0.2 × ATR)\n  stop_loss  = support - (1.5 × ATR)\n\
+      \  risk       = entry_high - stop_loss\n  tp1        = entry_high + (tp1_r ×\
+      \ risk)\n  tp2        = entry_high + (tp2_r × risk)\n"
+    # Optimized 2026-04-19/20 — multi-asset grid search + regime learner (BTC-USD)
+    # Only viable on BTC-USD (Gold/S&P500 consistently negative)
+    # require_rsi_divergence=True: BTC OOS PF 1.36→2.10, WR 33%→44% (+55%)
+    # Tradeoff: signals drop 350→34 (high selectivity — only take confirmed bounces)
+    # New gates (2026-04-20, training signal strong, n=15 test too small to auto-validate):
+    #   candle_close_pct_max=0.4: wins close in bottom 24% vs losses 58% — genuine pullback
+    #   require_cmf_neutral: CMF neutral WR=48% vs accumulation/distribution WR=0-8%
+    #   require_stoch_not_overbought: stoch overbought WR=7% vs oversold WR=41%
+    #   require_ema_not_bullish: full bull EMA alignment WR=5% — avoid chasing uptrends
     params:
       ema_period: 20
-      adx_threshold: 18
+      adx_threshold: 22
       rsi_max: 55
-      tp1_r: 1.5
-      tp2_r: 3.0
-      tp1_alloc: 60
-      tp2_alloc: 40
-      win_rate: 0.45
+      tp1_r: 3.0
+      tp2_r: 4.0
+      tp1_alloc: 70
+      tp2_alloc: 30
+      win_rate: 0.44
+      require_rsi_divergence: true
+      require_pin_bar: false
+      candle_close_pct_max: 1.0        # off globally — enable per-asset (BTC: 0.4)
+      require_cmf_neutral: false        # off globally — enable per-asset (BTC: true)
+      require_stoch_not_overbought: false  # off globally — enable per-asset (BTC: true)
+      require_ema_not_bullish: false    # off globally — enable per-asset (BTC: true)

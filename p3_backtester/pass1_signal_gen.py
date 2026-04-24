@@ -25,11 +25,12 @@ console = Console()
 CACHE_DIR = Path(__file__).parent / "cache"
 
 
-def _cache_path(ticker: str, interval: str, bar_time: pd.Timestamp, use_claude: bool) -> Path:
-    unix_ms = int(bar_time.timestamp() * 1000)
-    safe    = ticker.replace("=", "").replace("-", "").replace("^", "")
-    suffix  = "_claude" if use_claude else ""
-    return CACHE_DIR / f"{safe}_{interval}_{unix_ms}{suffix}.json"
+def _cache_path(ticker: str, interval: str, bar_time: pd.Timestamp, use_claude: bool, strategy_name: str = "rule_engine") -> Path:
+    unix_ms  = int(bar_time.timestamp() * 1000)
+    safe     = ticker.replace("=", "").replace("-", "").replace("^", "")
+    strat    = strategy_name.lower().replace(" ", "_").replace("-", "_")
+    suffix   = "_claude" if use_claude else ""
+    return CACHE_DIR / f"{safe}_{interval}_{strat}_{unix_ms}{suffix}.json"
 
 
 def run_pass1(
@@ -100,7 +101,7 @@ def run_pass1(
 
         for i in signal_indices:
             bar_time   = df.index[i]
-            cache_file = _cache_path(ticker, interval, bar_time, use_claude)
+            cache_file = _cache_path(ticker, interval, bar_time, use_claude, strategy.name)
 
             if cache_file.exists() and not config.force_regenerate:
                 raw = json.loads(cache_file.read_text(encoding="utf-8"))

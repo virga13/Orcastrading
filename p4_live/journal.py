@@ -10,7 +10,7 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
 
-JOURNAL_DIR = Path(__file__).parent / "journal"
+JOURNAL_DIR = Path(__file__).parent / "journal_data"
 JOURNAL_DB  = JOURNAL_DIR / "live_trades.db"
 
 _SCHEMA = """
@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS trades (
     signal_date     TEXT NOT NULL,
     ticker          TEXT NOT NULL,
     strategy        TEXT NOT NULL DEFAULT 'mtf_trend',
+    timeframe       TEXT NOT NULL DEFAULT '1d',
     label           TEXT NOT NULL,
     direction       TEXT NOT NULL,
     entry_low       REAL NOT NULL,
@@ -61,7 +62,7 @@ CREATE TABLE IF NOT EXISTS trades (
     pnl_r           REAL,
     notes           TEXT,
     recorded_at     TEXT NOT NULL,
-    PRIMARY KEY (signal_date, ticker, strategy)
+    PRIMARY KEY (signal_date, ticker, strategy, timeframe)
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -98,6 +99,11 @@ def _conn() -> sqlite3.Connection:
     # Migrations — safe to run on every connect (no-op if column already exists)
     for migration in (
         "ALTER TABLE trades ADD COLUMN source TEXT DEFAULT 'scanner'",
+        "ALTER TABLE trades ADD COLUMN signal_bar_ts TEXT DEFAULT NULL",
+        "ALTER TABLE trades ADD COLUMN fill_bar_ts TEXT DEFAULT NULL",
+        "ALTER TABLE trades ADD COLUMN chart_screenshot_path TEXT DEFAULT NULL",
+        "ALTER TABLE trades ADD COLUMN mt5_ticket TEXT DEFAULT NULL",
+        "ALTER TABLE trades ADD COLUMN partial_close_pnl_r REAL DEFAULT NULL",
     ):
         try:
             c.execute(migration)
@@ -159,9 +165,10 @@ def record_signal(signal: dict) -> bool:
     Persist a fired signal. Returns False if (signal_date, ticker) already recorded.
     """
     conn = _conn()
+    tf = signal.get("timeframe", "1d")
     existing = conn.execute(
-        "SELECT 1 FROM trades WHERE signal_date=? AND ticker=? AND strategy=?",
-        (signal["signal_date"], signal["ticker"], signal.get("strategy", "mtf_trend")),
+        "SELECT 1 FROM trades WHERE signal_date=? AND ticker=? AND strategy=? AND timeframe=?",
+        (signal["signal_date"], signal["ticker"], signal.get("strategy", "mtf_trend"), tf),
     ).fetchone()
 
     if existing:
@@ -170,14 +177,14 @@ def record_signal(signal: dict) -> bool:
 
     conn.execute("""
         INSERT INTO trades (
-            signal_date, ticker, strategy, label, direction,
+            signal_date, ticker, strategy, timeframe, label, direction,
             entry_low, entry_high, stop_loss, tp1, tp2,
             tp1_alloc, tp2_alloc, risk_pts, rr, confidence, rationale,
             price_at_signal, atr_at_signal, rsi_at_signal, regime_note,
-            status, recorded_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)
+            signal_bar_ts, status, recorded_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)
     """, (
-        signal["signal_date"], signal["ticker"], signal.get("strategy", "mtf_trend"),
+        signal["signal_date"], signal["ticker"], signal.get("strategy", "mtf_trend"), tf,
         signal["label"], signal["direction"],
         signal["entry_low"], signal["entry_high"], signal["stop_loss"],
         signal["tp1"], signal.get("tp2"),
@@ -185,6 +192,7 @@ def record_signal(signal: dict) -> bool:
         signal.get("risk_pts"), signal.get("rr"), signal.get("confidence"),
         signal.get("rationale"), signal["price"], signal["atr"], signal["rsi"],
         signal.get("regime"),
+        signal.get("signal_bar_ts"),
         datetime.now(timezone.utc).isoformat(),
     ))
     _log(conn, signal["signal_date"], signal["ticker"], "signal_recorded",
@@ -281,20 +289,24 @@ def record_fill_close_direct(
     exit_price: float,
     exit_date: str,
     pnl_r: float,
+    strategy: str = "mtf_trend",
+    timeframe: str = "1d",
 ) -> None:
     """
     Atomically record fill + close with a pre-computed pnl_r.
     Used by the backfill script where the simulator already computed pnl_r.
+    strategy + timeframe must be included to avoid corrupting a different strategy's record
+    for the same ticker on the same date.
     """
     conn = _conn()
     conn.execute("""
         UPDATE trades
         SET status=?, fill_price=?, fill_date=?, exit_price=?, exit_date=?, pnl_r=?
-        WHERE signal_date=? AND ticker=?
+        WHERE signal_date=? AND ticker=? AND strategy=? AND timeframe=?
     """, (outcome, fill_price, fill_date, exit_price, exit_date, pnl_r,
-          signal_date, ticker))
+          signal_date, ticker, strategy, timeframe))
     _log(conn, signal_date, ticker, "backfill_closed",
-         f"fill={fill_price} exit={exit_price} pnl_r={pnl_r} outcome={outcome}")
+         f"strategy={strategy} tf={timeframe} fill={fill_price} exit={exit_price} pnl_r={pnl_r} outcome={outcome}")
     conn.commit()
     conn.close()
 
@@ -312,6 +324,65 @@ def record_expired(signal_date: str, ticker: str | None = None, strategy: str | 
     conn.close()
 
 
+def record_expired_direct(signal_date: str, ticker: str, strategy: str, timeframe: str = "1d") -> None:
+    """Expire a specific (signal_date, ticker, strategy, timeframe) record. No ambiguity."""
+    conn = _conn()
+    conn.execute(
+        "UPDATE trades SET status='expired' "
+        "WHERE signal_date=? AND ticker=? AND strategy=? AND timeframe=? AND status='pending'",
+        (signal_date, ticker, strategy, timeframe),
+    )
+    _log(conn, signal_date, ticker, "expired", f"tf={timeframe}")
+    conn.commit()
+    conn.close()
+
+
+def record_fill_direct(
+    signal_date: str,
+    ticker: str,
+    strategy: str,
+    timeframe: str,
+    fill_price: float,
+    fill_date: str,
+    fill_bar_ts: str | None = None,
+) -> None:
+    """Mark a pending trade as filled. Does not close it — outcome resolved later."""
+    conn = _conn()
+    conn.execute(
+        "UPDATE trades SET status='filled', fill_price=?, fill_date=?, fill_bar_ts=? "
+        "WHERE signal_date=? AND ticker=? AND strategy=? AND timeframe=? AND status='pending'",
+        (fill_price, fill_date, fill_bar_ts, signal_date, ticker, strategy, timeframe),
+    )
+    _log(conn, signal_date, ticker, "filled",
+         f"tf={timeframe} fill={fill_price} date={fill_date}")
+    conn.commit()
+    conn.close()
+
+
+def record_close_direct(
+    signal_date: str,
+    ticker: str,
+    strategy: str,
+    timeframe: str,
+    outcome: str,
+    exit_price: float,
+    exit_date: str,
+    pnl_r: float,
+) -> None:
+    """Close a filled trade with its final outcome and pre-computed pnl_r."""
+    conn = _conn()
+    conn.execute(
+        "UPDATE trades SET status=?, exit_price=?, exit_date=?, pnl_r=? "
+        "WHERE signal_date=? AND ticker=? AND strategy=? AND timeframe=? AND status='filled'",
+        (outcome, exit_price, exit_date, pnl_r,
+         signal_date, ticker, strategy, timeframe),
+    )
+    _log(conn, signal_date, ticker, "closed",
+         f"tf={timeframe} outcome={outcome} exit={exit_price} pnl_r={pnl_r}")
+    conn.commit()
+    conn.close()
+
+
 def add_note(signal_date: str, note: str, ticker: str | None = None, strategy: str | None = None) -> None:
     conn = _conn()
     row = _resolve(conn, signal_date, ticker, strategy)
@@ -321,6 +392,78 @@ def add_note(signal_date: str, note: str, ticker: str | None = None, strategy: s
     )
     conn.commit()
     conn.close()
+
+
+def save_trade_chart_screenshot(
+    signal_date: str, ticker: str, strategy: str, timeframe: str, path: str
+) -> None:
+    """Attach a chart screenshot path to a live trade."""
+    conn = _conn()
+    conn.execute(
+        "UPDATE trades SET chart_screenshot_path=? "
+        "WHERE signal_date=? AND ticker=? AND strategy=? AND timeframe=?",
+        (path, signal_date, ticker, strategy, timeframe),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ── MT5 execution tracking ───────────────────────────────────────────────────
+
+def record_mt5_ticket(
+    signal_date: str,
+    ticker: str,
+    strategy: str,
+    timeframe: str,
+    tickets: list[int],
+) -> None:
+    """Store MT5 order tickets (JSON array) for a trade after execution."""
+    import json as _json
+    conn = _conn()
+    conn.execute(
+        "UPDATE trades SET mt5_ticket=? "
+        "WHERE signal_date=? AND ticker=? AND strategy=? AND timeframe=?",
+        (_json.dumps(tickets), signal_date, ticker, strategy, timeframe),
+    )
+    _log(conn, signal_date, ticker, "mt5_orders_placed", f"tickets={tickets}")
+    conn.commit()
+    conn.close()
+
+
+def update_partial_close_pnl(
+    signal_date: str,
+    ticker: str,
+    strategy: str,
+    timeframe: str,
+    partial_pnl_r: float,
+) -> None:
+    """
+    Record the P&L of legs that have already closed while at least one runner is still open.
+    Does NOT change the trade status — the trade stays 'filled' until all legs close.
+    Idempotent: safe to call on every monitor cycle.
+    """
+    conn = _conn()
+    conn.execute(
+        "UPDATE trades SET partial_close_pnl_r=? "
+        "WHERE signal_date=? AND ticker=? AND strategy=? AND timeframe=? AND status='filled'",
+        (round(partial_pnl_r, 3), signal_date, ticker, strategy, timeframe),
+    )
+    _log(conn, signal_date, ticker, "mt5_partial_close",
+         f"pnl_so_far={partial_pnl_r:+.3f}R strategy={strategy} tf={timeframe}")
+    conn.commit()
+    conn.close()
+
+
+def get_mt5_open_trades() -> list[dict]:
+    """Return pending/filled trades that have an MT5 ticket (managed by MT5 terminal)."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM trades "
+        "WHERE status IN ('pending','filled') AND mt5_ticket IS NOT NULL "
+        "ORDER BY signal_date, ticker"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 # ── Expiry ───────────────────────────────────────────────────────────────────
@@ -425,23 +568,52 @@ def save_manual_entry(data: dict) -> int:
     conn = _conn()
     cursor = conn.execute("""
         INSERT INTO manual_entries (
-            entry_date, asset, direction, entry_price, stop_loss, take_profit,
-            exit_price, pnl_r, quality_score, notes, ai_analysis,
-            screenshot_path, tags, recorded_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            entry_date, asset, direction, entry_price, stop_loss, original_sl,
+            take_profit, exit_price, pnl_r, pnl_dollars, quality_score, notes,
+            ai_analysis, screenshot_path, chart_screenshot_path, tags, recorded_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         data.get("entry_date", _date.today().isoformat()),
         data.get("asset"), data.get("direction"),
-        data.get("entry_price"), data.get("stop_loss"), data.get("take_profit"),
-        data.get("exit_price"), data.get("pnl_r"), data.get("quality_score"),
+        data.get("entry_price"), data.get("stop_loss"), data.get("original_sl"),
+        data.get("take_profit"),
+        data.get("exit_price"), data.get("pnl_r"), data.get("pnl_dollars"),
+        data.get("quality_score"),
         data.get("notes"), data.get("ai_analysis"),
-        data.get("screenshot_path"), data.get("tags"),
+        data.get("screenshot_path"), data.get("chart_screenshot_path"),
+        data.get("tags"),
         datetime.now(timezone.utc).isoformat(),
     ))
     entry_id = cursor.lastrowid
     conn.commit()
     conn.close()
     return entry_id
+
+
+def update_manual_entry(entry_id: int, **fields) -> None:
+    """Update specific fields on an existing manual entry (e.g. exit_price, pnl_r)."""
+    if not fields:
+        return
+    allowed = {"exit_price", "pnl_r", "pnl_dollars", "stop_loss", "original_sl",
+               "take_profit", "notes", "tags", "quality_score",
+               "chart_screenshot_path", "screenshot_path", "direction"}
+    valid = {k: v for k, v in fields.items() if k in allowed}
+    if not valid:
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in valid)
+    conn = _conn()
+    conn.execute(f"UPDATE manual_entries SET {set_clause} WHERE id = ?",
+                 (*valid.values(), entry_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_manual_entry(entry_id: int) -> None:
+    """Permanently delete a manual journal entry by id."""
+    conn = _conn()
+    conn.execute("DELETE FROM manual_entries WHERE id = ?", (entry_id,))
+    conn.commit()
+    conn.close()
 
 
 def get_manual_entries(limit: int = 200) -> list[dict]:

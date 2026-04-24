@@ -2,17 +2,18 @@
 run_scheduler.py — Orcastrading continuous market scanner.
 
 Runs 24/7, scanning for setups across all configured assets and strategies.
-Sends Telegram/email alerts immediately when a signal fires.
+Sends Telegram alerts immediately when a signal fires.
 
-Schedule:
-  Every 15 min, 16:30–18:30 local (US session open) → ORB scan
-  Every day at 22:00 local                           → Daily scan (MTF Trend, Momentum)
-  At startup                                         → Telegram "scheduler started" alert
+Schedule (all times are Romania local — EEST = UTC+3 in summer, EET = UTC+2 in winter):
+  Every 15 min, 15:30–18:30 local  → 15m intraday scan  (US session open, 2h)
+  Every 4 hours around the clock   → 4h / 1h scan
+  Daily at 22:00 local             → 1d scan + HTML report + daily summary
+  At startup                       → All three scans run once immediately
 
 Usage:
   python run_scheduler.py
 
-To run at Windows startup:
+To run at Windows startup (run once as Administrator):
   schtasks /create /tn "Orcastrading Scheduler" ^
     /tr "\"C:\\Users\\admin\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe\" \"C:\\Users\\admin\\Desktop\\Orcastrading\\run_scheduler.py\"" ^
     /sc onstart /ru SYSTEM /f
@@ -22,10 +23,11 @@ Logs: logs/scheduler.log
 import sys
 import io
 import os
+import json
 import logging
 import schedule
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
 
 # ── UTF-8 stdout (avoid Windows CP1252 issues) ────────────────────────────────
@@ -53,10 +55,33 @@ logging.basicConfig(
 )
 log = logging.getLogger("orcastrading")
 
-# ── US session window for intraday scans (local time) ─────────────────────────
-# Adjust these if your system clock is not GMT+2 (Romanian time).
-# 16:30–18:30 local = 09:30–11:30 ET = first 2 hours of NYSE session.
-INTRADAY_START = dtime(16, 30)
+# ── Last-run tracking (missed-job catch-up) ───────────────────────────────────
+_LAST_RUN_PATH = LOG_DIR / "scheduler_last_run.json"
+
+
+def _read_last_run() -> dict:
+    try:
+        if _LAST_RUN_PATH.exists():
+            return json.loads(_LAST_RUN_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _write_last_run(job: str) -> None:
+    data = _read_last_run()
+    data[job] = datetime.now().isoformat()
+    try:
+        _LAST_RUN_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+# ── US session intraday window (Romania local time) ───────────────────────────
+# Romania is EEST (UTC+3) from late March to late October.
+# 15:30–18:30 local = 12:30–15:30 UTC = 08:30–11:30 ET (pre-open + first 2h)
+# Adjust if your system clock does not match Romania local time.
+INTRADAY_START = dtime(15, 30)
 INTRADAY_END   = dtime(18, 30)
 
 
@@ -65,215 +90,297 @@ def _within_intraday_window() -> bool:
     return INTRADAY_START <= now <= INTRADAY_END
 
 
-# ── Intraday scan (ORB + any 15m strategy) ────────────────────────────────────
+def _at_bar_boundary(bar_minutes: int = 15, window_secs: int = 90) -> bool:
+    """True when within window_secs seconds after a completed N-minute bar close."""
+    now = datetime.now()
+    elapsed_secs = (now.minute % bar_minutes) * 60 + now.second
+    return elapsed_secs <= window_secs
 
-def run_intraday_scan():
-    if not _within_intraday_window():
-        return   # outside trading window — job fires every 15 min but skips silently
 
-    log.info("Intraday scan starting...")
+# ── MT5: execute a signal and store tickets in journal ────────────────────────
+
+def _execute_mt5(result: dict) -> None:
+    """Place MT5 pending orders for a fired signal and record the tickets."""
     try:
-        from core.config import get_watchlist, get_strategy_timeframe
+        from p4_live import mt5_broker
+        if not mt5_broker.is_enabled():
+            return
+        tickets = mt5_broker.execute_signal(result)
+        if tickets:
+            from p4_live.journal import record_mt5_ticket
+            record_mt5_ticket(
+                result["signal_date"],
+                result["ticker"],
+                result.get("strategy", "mtf_trend"),
+                result.get("timeframe", "1d"),
+                tickets,
+            )
+            log.info(f"  MT5 orders placed: tickets={tickets}")
+        else:
+            log.warning(
+                f"  MT5 execution failed for {result['label']} — "
+                f"trade is journal-only (check MT5_ENABLED / tickers.mt5)"
+            )
+    except Exception as e:
+        log.error(f"MT5 execute failed: {e}", exc_info=True)
+
+
+# ── MT5: sync open positions back into journal ────────────────────────────────
+
+def _run_mt5_monitor() -> None:
+    """Poll MT5 terminal for fills/closes and write them to the journal."""
+    try:
+        from p4_live import mt5_broker
+        if not mt5_broker.is_enabled():
+            return
+        from p4_live.mt5_monitor import sync_mt5_positions
+        updates = sync_mt5_positions()
+        if updates:
+            fills   = sum(1 for u in updates if u.get("status") == "filled")
+            closed  = sum(1 for u in updates if u.get("status") in
+                         ("win", "loss", "partial_win", "breakeven"))
+            expired = sum(1 for u in updates if u.get("status") == "expired")
+            log.info(f"MT5 monitor: {fills} filled, {closed} closed, {expired} expired")
+    except Exception as e:
+        log.error(f"MT5 monitor error: {e}", exc_info=True)
+
+
+# ── Shared: run simulate_pending after any scan ───────────────────────────────
+
+def _run_simulate() -> None:
+    """Resolve pending → filled → closed for all open trades."""
+    try:
+        from p4_live.simulate import simulate_pending
+        results = simulate_pending()
+        fills   = sum(1 for r in results if r.get("status") == "filled")
+        active  = sum(1 for r in results if r.get("status") == "active")
+        closed  = sum(1 for r in results if r.get("outcome") in ("win", "loss", "partial_win"))
+        expired = sum(1 for r in results if r.get("status") == "expired")
+        if any([fills, active, closed, expired]):
+            log.info(f"  Simulate: {fills} filled, {active} active, {closed} closed, {expired} expired")
+    except Exception as e:
+        log.error(f"Simulate failed: {e}", exc_info=True)
+
+
+# ── Shared: rule-based scan for specific timeframes ───────────────────────────
+
+def _load_risk_gates() -> dict:
+    """
+    Load account-level risk gates from .env.
+    Returns dict with: max_open (int), daily_limit_r (float), weekly_limit_r (float).
+    Zero means the gate is disabled.
+    """
+    return {
+        "max_open":       int(float(os.getenv("MAX_OPEN_TRADES", "5"))),
+        "daily_limit_r":  float(os.getenv("DAILY_LOSS_LIMIT_R", "0")),
+        "weekly_limit_r": float(os.getenv("WEEKLY_DD_LIMIT_R", "0")),
+    }
+
+
+def _check_risk_gates(gates: dict, n_open: int, daily_pnl: float, weekly_pnl: float) -> str | None:
+    """
+    Return a human-readable reason string if a new signal should be suppressed,
+    or None if all gates pass.
+    """
+    if n_open >= gates["max_open"]:
+        return f"max open trades reached ({n_open}/{gates['max_open']})"
+    if gates["daily_limit_r"] > 0 and daily_pnl <= -gates["daily_limit_r"]:
+        return f"daily loss limit hit ({daily_pnl:+.2f}R / -{gates['daily_limit_r']:.1f}R)"
+    if gates["weekly_limit_r"] > 0 and weekly_pnl <= -gates["weekly_limit_r"]:
+        return f"weekly DD limit hit ({weekly_pnl:+.2f}R / -{gates['weekly_limit_r']:.1f}R)"
+    return None
+
+
+def _run_scan(label: str, timeframe_filter: list[str] | None = None) -> tuple[list[dict], int]:
+    """
+    Scan every (asset, strategy, timeframe) triple in the watchlist,
+    optionally filtered to specific timeframes.
+    Records new signals, fires Telegram alerts, then resolves pending trades.
+    Returns (fired_signals, total_pairs_checked).
+
+    Risk gates (read from .env before each scan):
+      MAX_OPEN_TRADES     — suppress new signals when open/pending count >= this
+      DAILY_LOSS_LIMIT_R  — suppress new signals when today's closed P&L <= -limit
+      WEEKLY_DD_LIMIT_R   — suppress new signals when this week's closed P&L <= -limit
+      Zero (default) means the gate is disabled.
+    """
+    from datetime import date as _date, timedelta as _td
+    log.info(f"{label} scan starting...")
+    fired_signals: list[dict] = []
+    try:
+        from core.config import get_watchlist
         from p4_live.scanner import scan_strategy
-        from p4_live.journal import record_signal, get_active_strategy_set
+        from p4_live.journal import (record_signal, get_active_strategy_set,
+                                     get_active_ticker_set, get_open_trades,
+                                     get_closed_trades)
         from p4_live.alerts import alert_signal
 
-        intraday_pairs = [
-            (aid, sid) for aid, sid in get_watchlist()
-            if get_strategy_timeframe(sid) != "1d"
-        ]
+        watchlist = get_watchlist()
+        if timeframe_filter:
+            watchlist = [(a, s, tf) for a, s, tf in watchlist if tf in timeframe_filter]
 
-        active = get_active_strategy_set()
-        fired  = 0
+        if not watchlist:
+            log.warning(f"{label}: no pairs found for timeframes {timeframe_filter}")
+            return fired_signals, 0
 
-        for asset_id, strategy_id in intraday_pairs:
+        active       = get_active_strategy_set()
+        open_tickers = list(get_active_ticker_set())
+        checked      = 0
+
+        # ── Risk gate state (computed once, updated as signals fire) ──────────
+        gates = _load_risk_gates()
+        n_open = len(get_open_trades())
+
+        today_str  = _date.today().isoformat()
+        week_start = (_date.today() - _td(days=_date.today().weekday())).isoformat()
+        closed_all = get_closed_trades()
+
+        daily_pnl = sum(
+            t["pnl_r"] for t in closed_all
+            if t.get("exit_date") == today_str and t.get("pnl_r") is not None
+        ) if gates["daily_limit_r"] > 0 else 0.0
+
+        weekly_pnl = sum(
+            t["pnl_r"] for t in closed_all
+            if (t.get("exit_date") or "") >= week_start and t.get("pnl_r") is not None
+        ) if gates["weekly_limit_r"] > 0 else 0.0
+
+        for asset_id, strategy_id, timeframe in watchlist:
+            checked += 1
             try:
-                result = scan_strategy(asset_id, strategy_id)
+                result = scan_strategy(asset_id, strategy_id, timeframe=timeframe)
             except Exception as e:
-                log.warning(f"  {asset_id}/{strategy_id}: {e}")
+                log.warning(f"  {asset_id}/{strategy_id}/{timeframe}: {e}")
                 continue
 
             if not result.get("fired"):
-                log.debug(f"  {result['label']:8} [{strategy_id}] no signal")
+                log.debug(f"  {result.get('label', asset_id):8} [{strategy_id}@{timeframe}] no signal")
                 continue
 
             ticker = result["ticker"]
             if (ticker, strategy_id) in active:
-                log.info(f"  {result['label']:8} [{strategy_id}] signal skipped — trade already open")
+                log.info(
+                    f"  {result['label']:8} [{strategy_id}@{timeframe}] "
+                    f"signal skipped — trade already open"
+                )
+                continue
+
+            # ── Account-level risk gates ──────────────────────────────────────
+            block_reason = _check_risk_gates(gates, n_open, daily_pnl, weekly_pnl)
+            if block_reason:
+                log.warning(
+                    f"  {result.get('label', asset_id):8} [{strategy_id}@{timeframe}] "
+                    f"signal blocked — {block_reason}"
+                )
                 continue
 
             recorded = record_signal(result)
             if recorded:
                 log.info(
-                    f"  {result['label']:8} [{strategy_id}] SIGNAL FIRED "
+                    f"  {result['label']:8} [{strategy_id}@{timeframe}] SIGNAL FIRED "
                     f"{result['direction'].upper()} "
                     f"entry {result['entry_low']:,.2f}–{result['entry_high']:,.2f}"
                 )
-                alert_signal(result)
-                fired += 1
+                alert_signal(result, open_positions=open_tickers)
+                _execute_mt5(result)
+                active.add((ticker, strategy_id))   # block same strategy on other TFs this scan
+                if ticker not in open_tickers:
+                    open_tickers.append(ticker)
+                n_open += 1   # keep the gate counter in sync for remaining signals
+                fired_signals.append(result)
             else:
-                log.info(f"  {result['label']:8} [{strategy_id}] already in journal")
+                log.info(f"  {result['label']:8} [{strategy_id}@{timeframe}] already in journal")
 
-        log.info(f"Intraday scan done — {fired} new signal(s) across {len(intraday_pairs)} pairs")
+        log.info(f"{label} scan done — {len(fired_signals)} new signal(s) across {checked} pair(s)")
 
     except Exception as e:
-        log.error(f"Intraday scan failed: {e}", exc_info=True)
+        log.error(f"{label} scan failed: {e}", exc_info=True)
+
+    # Always attempt to resolve pending/filled trades after a scan
+    _run_simulate()
+    return fired_signals, checked
 
 
-# ── Daily scan (P1 AI strategy scanner + open-trade check) ───────────────────
+# ── Intraday scan: 15m bars during US session open ────────────────────────────
+
+def run_intraday_scan():
+    """15m bar scan — fires every 15 min but only executes inside the intraday window
+    and within 90 seconds of a completed 15-minute bar close."""
+    if not _within_intraday_window():
+        return
+    if not _at_bar_boundary():
+        log.debug("15m scan skipped — not at a bar boundary")
+        return
+    _run_scan("Intraday (15m)", timeframe_filter=["15m"])  # return value unused
+    _write_last_run("15m")
+
+
+# ── 4h/1h scan: runs every 4 hours around the clock ──────────────────────────
+
+def run_4h_scan():
+    """4h and 1h bar scan — runs every 4 hours regardless of session."""
+    _run_scan("Multi-TF (4h/1h)", timeframe_filter=["4h", "1h"])
+    _write_last_run("4h")
+
+
+# ── Morning scan: catch the US daily bar that closed after last night's 22:00 ──
+
+def run_morning_scan():
+    """
+    09:00 local scan for 1d strategies.
+
+    Why this exists: the daily 22:00 scan runs BEFORE the US market closes
+    (US close = 23:00 Romania EEST). The bar that closed at 23:00 is therefore
+    not visible until this morning scan, which fires 10 hours later.
+    Without this scan, today's US daily bar would wait 23 hours (until tomorrow's
+    22:00 scan) before any signals are evaluated.
+
+    European markets (GER40) close at ~19:30 Romania — already captured by the
+    22:00 scan — but they're re-evaluated here harmlessly (dedup prevents dups).
+    """
+    _run_scan("Morning (1d)", timeframe_filter=["1d"])
+    _write_last_run("morning")
+
+
+# ── Daily scan: 1d bars + maintenance ────────────────────────────────────────
 
 def run_daily_scan():
-    log.info("Daily scan starting...")
-    try:
-        from core.config import get_all_assets, get_strategy_config
-        from p1_analysis_engine.strategy_scanner import scan_asset_for_strategies
-        from p1_analysis_engine.fetchers.calendar import get_event_today
-        from p1_analysis_engine.fetchers.macro import fetch_macro
-        from p4_live.journal import (record_signal, get_active_strategy_set,
-                                     get_open_trades, expire_stale_signals,
-                                     get_active_ticker_set)
-        from p4_live.alerts import (alert_signal, alert_daily_summary,
-                                    alert_circuit_breaker, alert_degradation)
-        from p4_live.risk import position_sizing, check_circuit_breaker, check_degradation
+    """
+    1d bar scan at end of day.
+    Also runs strategy degradation checks, auto-expires stale signals,
+    generates the HTML forward-test report, and sends a daily summary.
+    """
+    fired_signals, _checked = _run_scan("Daily (1d)", timeframe_filter=["1d"])
 
-        # ── Auto-expire stale pending signals ─────────────────────────────────
+    # ── Auto-expire stale pending signals (1d strategies only) ───────────────
+    try:
+        from core.config import get_strategy_config
+        from p4_live.journal import expire_stale_signals
         expiry_map = {}
-        for sid in ["mtf_trend", "momentum_breakout", "orb"]:
-            cfg = get_strategy_config(sid)
-            expiry_map[sid] = cfg.get("expiry_days", 5)
+        for sid in ["mtf_trend", "momentum_breakout", "ema_continuation", "ema_pullback"]:
+            try:
+                cfg = get_strategy_config(sid)
+                expiry_map[sid] = cfg.get("expiry_days", 5)
+            except Exception:
+                pass
         expired_n = expire_stale_signals(expiry_map)
         if expired_n:
             log.info(f"Auto-expired {expired_n} stale pending signal(s)")
+    except Exception as e:
+        log.warning(f"Auto-expire failed: {e}")
 
-        # ── Open position tickers (for correlation cap) ───────────────────────
-        open_tickers = list(get_active_ticker_set())
+    # ── Strategy degradation checks ───────────────────────────────────────────
+    try:
+        from core.config import get_all_assets
+        from p4_live.alerts import alert_degradation
+        from p4_live.risk import check_degradation
 
-        # ── Economic calendar check ───────────────────────────────────────────
-        event = get_event_today()
-        if event:
-            log.warning(
-                f"High-impact event: {event['name']} on {event['date']} "
-                f"({event['days_away']} day(s) away) — signals will be flagged"
-            )
-
-        # ── Fetch macro once — shared across all assets ───────────────────────
-        macro_context: dict = {}
-        vix_level: float | None = None
-        try:
-            macro_context = fetch_macro("equity")
-            vix_level = macro_context.get("vix_level")
-            vix_reg = macro_context.get("vix_regime", "")
-            log.info(f"Macro: VIX={vix_level} ({vix_reg})  macro_bias={macro_context.get('macro_bias','?')}")
-        except Exception as e:
-            log.warning(f"Macro fetch failed: {e} — scanning without macro context")
-
-        all_assets = get_all_assets()
-        active     = get_active_strategy_set()
-        fired_signals: list[dict] = []
-        fired = 0
-
-        for asset in all_assets:
-            asset_id = asset["id"]
-            try:
-                scan = scan_asset_for_strategies(
-                    asset_id, macro_context=macro_context
-                )
-            except Exception as e:
-                log.warning(f"  {asset_id}: P1 scan failed — {e}")
-                continue
-
-            for signal in scan.signals:
-                if not signal.fired:
-                    log.debug(f"  {scan.label:8} [{signal.strategy_id}] no signal")
-                    continue
-
-                # ── Circuit breaker ───────────────────────────────────────────
-                breached, live_dd, max_dd = check_circuit_breaker(
-                    scan.ticker, signal.strategy_id
-                )
-                if breached:
-                    log.warning(
-                        f"  {scan.label} [{signal.strategy_id}] CIRCUIT BREAKER "
-                        f"live_dd={live_dd}R >= max={max_dd}R — signal skipped"
-                    )
-                    alert_circuit_breaker(
-                        scan.ticker, signal.strategy_id, scan.label, live_dd, max_dd
-                    )
-                    continue
-
-                # ── Confidence gate via position sizing ───────────────────────
-                risk_pts = None
-                if signal.entry_high is not None and signal.stop_loss is not None:
-                    risk_pts = round(signal.entry_high - signal.stop_loss, 4)
-
-                signal_dict = {
-                    "signal_date": scan.analysis_date,
-                    "ticker":      scan.ticker,
-                    "strategy":    signal.strategy_id,
-                    "label":       scan.label,
-                    "direction":   signal.direction,
-                    "entry_low":   signal.entry_low,
-                    "entry_high":  signal.entry_high,
-                    "stop_loss":   signal.stop_loss,
-                    "tp1":         signal.tp1,
-                    "tp2":         signal.tp2,
-                    "tp1_alloc":   70,
-                    "tp2_alloc":   30,
-                    "risk_pts":    risk_pts,
-                    "rr":          signal.rr,
-                    "confidence":  signal.confidence,
-                    "rationale":   signal.rationale,
-                    "price":       scan.current_price,
-                    "atr":         scan.atr,
-                    "rsi":         scan.rsi,
-                    "regime":      scan.market_regime,
-                    "fired":       True,
-                }
-
-                sizing = position_sizing(
-                    signal_dict,
-                    open_positions=open_tickers,
-                    vix_level=vix_level,
-                )
-                if sizing["skip"]:
-                    log.info(
-                        f"  {scan.label} [{signal.strategy_id}] skipped — "
-                        f"{sizing['sizing_note']}"
-                    )
-                    continue
-
-                if (scan.ticker, signal.strategy_id) in active:
-                    log.info(f"  {scan.label} [{signal.strategy_id}] skipped — trade already open")
-                    continue
-
-                # ── Economic calendar flag ────────────────────────────────────
-                if event:
-                    signal_dict["rationale"] = (
-                        f"[{event['name']} in {event['days_away']}d — verify before entry] "
-                        + signal_dict["rationale"]
-                    )
-
-                recorded = record_signal(signal_dict)
-                if recorded:
-                    log.info(
-                        f"  {scan.label} [{signal.strategy_id}] SIGNAL FIRED "
-                        f"{signal.direction.upper()} "
-                        f"entry {signal.entry_low:,.2f}–{signal.entry_high:,.2f}  "
-                        f"suggest {sizing['suggested_pct']:.1%} risk"
-                    )
-                    alert_signal(signal_dict)
-                    fired_signals.append(signal_dict)
-                    fired += 1
-                    # Update local open_tickers so correlation cap catches same-scan co-firing
-                    if scan.ticker not in open_tickers:
-                        open_tickers.append(scan.ticker)
-                else:
-                    log.info(f"  {scan.label} [{signal.strategy_id}] already in journal")
-
-        # ── Strategy degradation checks ───────────────────────────────────────
-        for asset in all_assets:
+        for asset in get_all_assets():
             ticker = asset.get("tickers", {}).get("yfinance", "")
-            for strategy_id in asset.get("strategies", []):
+            for entry in asset.get("strategies", []):
+                strategy_id = entry if isinstance(entry, str) else entry.get("id")
+                if not strategy_id:
+                    continue
                 stats = check_degradation(ticker, strategy_id)
                 if stats.get("degraded"):
                     log.warning(
@@ -282,28 +389,28 @@ def run_daily_scan():
                         f"(p={stats['p_value']:.3f})"
                     )
                     alert_degradation(ticker, strategy_id, asset["label"], stats)
-
-        # ── Open trade check ──────────────────────────────────────────────────
-        open_trades = get_open_trades()
-        if open_trades:
-            log.info(f"Open trades: {len(open_trades)}")
-            _check_open_trades(open_trades)
-
-        # ── Daily summary + HTML report ───────────────────────────────────────
-        alert_daily_summary(fired_signals)
-
-        try:
-            from p4_live.html_report import generate_html
-            path = generate_html()
-            log.info(f"HTML report: {path}")
-        except Exception as e:
-            log.warning(f"HTML report failed: {e}")
-
-        log.info(f"Daily scan done — {fired} new signal(s) across {len(all_assets)} assets")
-
     except Exception as e:
-        log.error(f"Daily scan failed: {e}", exc_info=True)
+        log.warning(f"Degradation checks failed: {e}")
 
+    # ── HTML forward-test report ──────────────────────────────────────────────
+    try:
+        from p4_live.html_report import generate_html
+        path = generate_html()
+        log.info(f"HTML report: {path}")
+    except Exception as e:
+        log.warning(f"HTML report failed: {e}")
+
+    # ── Daily summary alert ───────────────────────────────────────────────────
+    try:
+        from p4_live.alerts import alert_daily_summary
+        alert_daily_summary(fired_signals, total_pairs=_checked)
+    except Exception as e:
+        log.warning(f"Daily summary alert failed: {e}")
+
+    _write_last_run("daily")
+
+
+# ── Open trade price check (shared by daily scan and _check_open_trades) ─────
 
 def _check_open_trades(open_trades: list[dict]) -> None:
     """Check each open trade against latest price and fire alerts as needed."""
@@ -353,6 +460,50 @@ def _check_open_trades(open_trades: list[dict]) -> None:
                     alert_price("tp", t, price, f"Low {low:,.2f} <= TP1 {t['tp1']:,.2f}")
 
 
+# ── Missed-job catch-up ───────────────────────────────────────────────────────
+
+def _run_catchup() -> None:
+    """
+    Run any scheduled jobs that were missed while the scheduler was offline
+    (e.g. machine sleep, reboot). Called once at startup before the loop begins.
+
+    Catch-up thresholds:
+      daily — re-runs if last run was > 26h ago (catches one missed 22:00 window)
+      4h    — re-runs if last run was > 4.5h ago
+      15m   — skipped; handled by the normal scheduled tick as soon as we re-enter
+               the intraday window and reach a bar boundary
+    """
+    last = _read_last_run()
+    now  = datetime.now()
+
+    daily_last   = datetime.fromisoformat(last["daily"])   if "daily"   in last else None
+    morning_last = datetime.fromisoformat(last["morning"]) if "morning" in last else None
+    h4_last      = datetime.fromisoformat(last["4h"])      if "4h"      in last else None
+
+    if daily_last is None or (now - daily_last) > timedelta(hours=26):
+        log.info("Catch-up: daily scan not run in > 26h — running now")
+        run_daily_scan()
+    else:
+        log.info(f"Catch-up: daily OK (last ran {daily_last:%Y-%m-%d %H:%M})")
+
+    if morning_last is None or (now - morning_last) > timedelta(hours=26):
+        log.info("Catch-up: morning scan not run today — running now")
+        run_morning_scan()
+    else:
+        log.info(f"Catch-up: morning OK (last ran {morning_last:%Y-%m-%d %H:%M})")
+
+    if h4_last is None or (now - h4_last) > timedelta(hours=4, minutes=30):
+        log.info("Catch-up: 4h/1h scan not run in > 4.5h — running now")
+        run_4h_scan()
+    else:
+        log.info(f"Catch-up: 4h/1h OK (last ran {h4_last:%Y-%m-%d %H:%M})")
+
+    if _within_intraday_window():
+        log.info("Catch-up: inside intraday window — running 15m scan once")
+        _run_scan("Intraday (15m) [catch-up]", timeframe_filter=["15m"])
+        _write_last_run("15m")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -360,47 +511,74 @@ def main():
     log.info("Orcastrading scheduler starting")
     log.info("=" * 60)
 
-    # Startup alert
+    # Startup Telegram alert
     try:
-        from core.config import get_all_assets, get_watchlist, get_strategy_timeframe
+        from core.config import get_all_assets, get_watchlist
         from p4_live.alerts import alert_startup, is_configured
 
         assets     = [a["label"] for a in get_all_assets()]
-        strategies = list({sid for _, sid in get_watchlist()})
+        strategies = list({sid for _, sid, _ in get_watchlist()})
 
         if is_configured():
             alert_startup(strategies, assets)
             log.info("Startup alert sent")
         else:
-            log.warning("No alert channels configured — set TELEGRAM_BOT_TOKEN in .env")
+            log.warning("No Telegram token configured — set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env")
     except Exception as e:
         log.error(f"Startup alert failed: {e}")
 
-    # Schedule intraday scan every 15 minutes
-    schedule.every(15).minutes.do(run_intraday_scan)
-    log.info("Scheduled: intraday scan every 15 min (active 16:30–18:30 local)")
+    # ── MT5 connection ────────────────────────────────────────────────────────
+    try:
+        from p4_live import mt5_broker
+        if mt5_broker.is_enabled():
+            if mt5_broker.connect():
+                info = mt5_broker.get_account_info()
+                log.info(
+                    f"MT5 demo execution active — "
+                    f"account={info['login']}  balance={info['balance']:.2f} {info['currency']}"
+                )
+            else:
+                log.error("MT5 connection failed — execution disabled for this session")
+        else:
+            log.info("MT5 execution disabled (set MT5_ENABLED=true in .env to enable)")
+    except Exception as e:
+        log.error(f"MT5 startup error: {e}")
 
-    # Schedule daily scan at 22:00
+    # ── Schedule ──────────────────────────────────────────────────────────────
+    schedule.every(15).minutes.do(run_intraday_scan)
+    log.info(f"Scheduled: 15m intraday scan every 15 min (active {INTRADAY_START:%H:%M}–{INTRADAY_END:%H:%M} local)")
+
+    schedule.every(4).hours.do(run_4h_scan)
+    log.info("Scheduled: 4h/1h scan every 4 hours")
+
+    schedule.every().day.at("09:00").do(run_morning_scan)
+    log.info("Scheduled: morning 1d scan at 09:00 local (catches US bar closed after 22:00)")
+
     schedule.every().day.at("22:00").do(run_daily_scan)
-    log.info("Scheduled: daily scan at 22:00")
+    log.info("Scheduled: daily 1d scan at 22:00 local")
+
+    schedule.every(1).minutes.do(_run_mt5_monitor)
+    log.info("Scheduled: MT5 position monitor every 60 s")
 
     log.info("Scheduler running. Press Ctrl+C to stop.")
     log.info("-" * 60)
 
-    # Run daily scan immediately on startup (so you get a first report right away)
-    log.info("Running initial daily scan...")
-    run_daily_scan()
+    # ── Catch-up: run any jobs missed while the scheduler was offline ─────────
+    log.info("Running catch-up checks...")
+    _run_catchup()
 
+    _hb_path = LOG_DIR / "scheduler_heartbeat"
     while True:
         try:
             schedule.run_pending()
-            time.sleep(30)   # check every 30 seconds
+            _hb_path.touch()          # keep mtime fresh so UI shows "Scheduler ON"
+            time.sleep(30)
         except KeyboardInterrupt:
             log.info("Scheduler stopped by user.")
             break
         except Exception as e:
             log.error(f"Scheduler loop error: {e}", exc_info=True)
-            time.sleep(60)   # wait a minute before retrying
+            time.sleep(60)
 
 
 if __name__ == "__main__":

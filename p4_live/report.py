@@ -7,7 +7,7 @@ The baseline numbers are locked from the walk-forward TEST window.
 import math
 from datetime import date
 from p4_live.journal import get_all_trades, get_closed_trades
-from p4_live.scanner import ASSET_MAP, ASSETS   # ASSET_MAP keyed by yfinance ticker
+from core.config import get_asset_map, get_all_assets
 
 
 def _traffic_light(actual: float, target: float, tolerance: float = 0.10) -> str:
@@ -67,14 +67,6 @@ def compute_forward_stats(
         if dd > max_dd:
             max_dd = dd
 
-    # Sharpe
-    if len(pnl_rs) > 1:
-        mean = avg_r
-        var  = sum((r - mean) ** 2 for r in pnl_rs) / (len(pnl_rs) - 1)
-        sharpe = (mean / math.sqrt(var)) * math.sqrt(len(pnl_rs)) if var > 0 else 0.0
-    else:
-        sharpe = 0.0
-
     calmar = round(total_r / max_dd, 2) if max_dd > 0 else 0.0
 
     # ── Trade duration (fill_date → exit_date) ────────────────────────────────
@@ -88,6 +80,21 @@ def compute_forward_stats(
             except (ValueError, TypeError):
                 pass
     avg_duration = round(sum(durations) / len(durations), 1) if durations else None
+
+    # Sharpe (annualized) — scale by sqrt(trades per year) based on avg hold duration.
+    # Using per-trade R as returns and converting to annual frequency.
+    if len(pnl_rs) > 1:
+        mean = avg_r
+        var  = sum((r - mean) ** 2 for r in pnl_rs) / (len(pnl_rs) - 1)
+        std  = math.sqrt(var) if var > 0 else 0.0
+        if std > 0:
+            days_per_trade  = avg_duration if avg_duration and avg_duration > 0 else 5
+            trades_per_year = 252 / days_per_trade
+            sharpe = round((mean / std) * math.sqrt(trades_per_year), 2)
+        else:
+            sharpe = 0.0
+    else:
+        sharpe = 0.0
 
     # ── Actual R per win / loss (vs theoretical TP/SL) ───────────────────────
     win_pnl_r  = [t["pnl_r"] for t in wins   if t["pnl_r"] is not None]
@@ -129,14 +136,17 @@ def print_report(console, ticker: str | None = None) -> None:
     from rich.panel import Panel
     from rich import box
 
-    asset = ASSET_MAP.get(ticker) if ticker else ASSETS[0]
-    if ticker and asset is None:
+    _asset_map = get_asset_map()
+    _assets_with_yf = [a for a in get_all_assets() if a.get("tickers", {}).get("yfinance")]
+    asset = _asset_map.get(ticker) if ticker else (_assets_with_yf[0] if _assets_with_yf else None)
+    if asset is None:
         console.print(f"[red]Unknown ticker '{ticker}'[/red]")
         return
 
-    stats = compute_forward_stats(ticker=asset["ticker"])
-    base  = asset["baseline"]
-    label = asset["label"]
+    asset_ticker = asset.get("tickers", {}).get("yfinance", ticker)
+    stats = compute_forward_stats(ticker=asset_ticker)
+    base  = asset.get("baseline") or {}
+    label = asset.get("label", asset_ticker)
 
     console.print()
     console.print(Panel(

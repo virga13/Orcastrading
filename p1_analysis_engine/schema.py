@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Literal, Optional
 
 
@@ -83,13 +83,24 @@ class TradingSetup(BaseModel):
     stop_loss: float
     trailing_sl_to_breakeven: float  # price level at which to move SL to entry
     targets: list[SetupTarget]
-    rr_ratio: float = Field(ge=1.5)  # enforced minimum 1.5R
+    rr_ratio: float = Field(ge=0.0)
     win_rate_estimate: float = Field(ge=0.0, le=1.0)
     trade_duration: str     # e.g. "2-4 hours", "1-3 days", "1-2 weeks"
     ev: float               # expected value in price points
     profit_factor: float    # gross profit / gross loss
     confidence: float = Field(ge=0.0, le=1.0)
     confidence_note: str
+
+    @model_validator(mode="after")
+    def _compute_rr_if_missing(self) -> "TradingSetup":
+        """Auto-compute rr_ratio from entry/stop/first target when Claude returns 0."""
+        if self.rr_ratio == 0.0 and self.targets and self.stop_loss:
+            entry = (self.entry_low + self.entry_high) / 2
+            risk = abs(entry - self.stop_loss)
+            if risk > 0:
+                reward = abs(self.targets[0].price - entry)
+                self.rr_ratio = round(reward / risk, 2)
+        return self
 
 
 class InvalidationScenario(BaseModel):

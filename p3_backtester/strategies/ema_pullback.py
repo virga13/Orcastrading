@@ -69,11 +69,39 @@ class EMAPullbackStrategy(StrategyBase):
         adx_threshold: int = 18,
         win_rate: float = 0.45,
         min_rr: float = 1.5,
+        rsi_max: int = 55,
+        tp1_r: float = 1.5,
+        tp2_r: float = 3.0,
+        tp1_alloc: int = 60,
+        tp2_alloc: int = 40,
+        atr_pct_max: float = 999.0,          # skip extreme-vol bars
+        require_rsi_divergence: bool = False, # require bullish RSI divergence vs prev swing low
+        div_lookback: int = 10,              # bars to look back for divergence comparison
+        require_pin_bar: bool = False,        # require rejection candle (lower shadow >= pin_shadow_atr)
+        pin_shadow_atr: float = 0.8,         # lower shadow must be >= this × ATR
+        candle_close_pct_max: float = 1.0,   # max (close-low)/(high-low) — wins close near low (0.24)
+        require_cmf_neutral: bool = False,    # skip if CMF shows clear accumulation/distribution
+        require_stoch_not_overbought: bool = False,  # skip if stoch > 80 (WR 7% when overbought)
+        require_ema_not_bullish: bool = False,       # skip if EMA20>50>200 (WR 5% in bull alignment)
     ):
-        self.ema_period    = ema_period
-        self.adx_threshold = adx_threshold
-        self.win_rate      = win_rate
-        self.min_rr        = min_rr
+        self.ema_period                  = ema_period
+        self.adx_threshold               = adx_threshold
+        self.win_rate                    = win_rate
+        self.min_rr                      = min_rr
+        self.rsi_max                     = rsi_max
+        self.tp1_r                       = tp1_r
+        self.tp2_r                       = tp2_r
+        self.tp1_alloc                   = tp1_alloc
+        self.tp2_alloc                   = tp2_alloc
+        self.atr_pct_max                 = atr_pct_max
+        self.require_rsi_divergence      = require_rsi_divergence
+        self.div_lookback                = div_lookback
+        self.require_pin_bar             = require_pin_bar
+        self.pin_shadow_atr              = pin_shadow_atr
+        self.candle_close_pct_max        = candle_close_pct_max
+        self.require_cmf_neutral         = require_cmf_neutral
+        self.require_stoch_not_overbought = require_stoch_not_overbought
+        self.require_ema_not_bullish     = require_ema_not_bullish
 
     @property
     def params(self) -> dict:
@@ -81,6 +109,50 @@ class EMAPullbackStrategy(StrategyBase):
             "ema_period":    self.ema_period,
             "adx_threshold": self.adx_threshold,
         }
+
+    def _check_rsi_divergence(self, df: pd.DataFrame, bias: str) -> bool:
+        """
+        Bullish divergence for longs: price at new low vs lookback but RSI higher.
+        Bearish divergence for shorts: price at new high vs lookback but RSI lower.
+        """
+        if len(df) < self.div_lookback + 2:
+            return False
+        close  = df["Close"].values
+        rsi_s  = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
+        if rsi_s.isna().all():
+            return False
+
+        window = self.div_lookback
+        current_close = float(close[-1])
+        current_rsi   = float(rsi_s.iloc[-1])
+        past_closes   = close[-window - 1 : -1]
+        past_rsi      = rsi_s.iloc[-window - 1 : -1].values
+
+        if bias == "long":
+            # Find the prior lowest-price bar in the window
+            idx_low = int(past_closes.argmin())
+            prior_close = float(past_closes[idx_low])
+            prior_rsi   = float(past_rsi[idx_low])
+            # Divergence: price made a new low but RSI did not
+            return current_close < prior_close and current_rsi > prior_rsi
+        else:
+            idx_high = int(past_closes.argmax())
+            prior_close = float(past_closes[idx_high])
+            prior_rsi   = float(past_rsi[idx_high])
+            return current_close > prior_close and current_rsi < prior_rsi
+
+    def _check_pin_bar(self, df: pd.DataFrame, bias: str, atr: float) -> bool:
+        """
+        Bullish pin bar: lower shadow (Close - Low) >= pin_shadow_atr × ATR.
+        Bearish pin bar: upper shadow (High - Close) >= pin_shadow_atr × ATR.
+        """
+        bar   = df.iloc[-1]
+        if bias == "long":
+            lower_shadow = float(bar["Close"]) - float(bar["Low"])
+            return lower_shadow >= self.pin_shadow_atr * atr
+        else:
+            upper_shadow = float(bar["High"]) - float(bar["Close"])
+            return upper_shadow >= self.pin_shadow_atr * atr
 
     def _get_ema(self, df: pd.DataFrame) -> float | None:
         close = df["Close"]
@@ -102,6 +174,11 @@ class EMAPullbackStrategy(StrategyBase):
         if adx < self.adx_threshold:
             return None
 
+        # Volatility cap — skip chaotic/crash bars
+        atr_pct = tech.get("atr_pct", 0.0)
+        if atr_pct > self.atr_pct_max:
+            return None
+
         ema_val = self._get_ema(df)
         if ema_val is None:
             return None
@@ -111,11 +188,12 @@ class EMAPullbackStrategy(StrategyBase):
 
         # Long setup: price has pulled below EMA, near support, RSI < 55
         # Short setup: price has rallied above EMA, near resistance, RSI > 45
-        if dist_atr < -0.1 and dist_atr > -2.5 and rsi < 55:
+        rsi_min_short = 100 - self.rsi_max   # symmetric: rsi_max=55 → short requires rsi>45
+        if dist_atr < -0.1 and dist_atr > -2.5 and rsi < self.rsi_max:
             # Price is below EMA — long bounce setup
             bias = "long"
             level = support
-        elif dist_atr > 0.1 and dist_atr < 2.5 and rsi > 45:
+        elif dist_atr > 0.1 and dist_atr < 2.5 and rsi > rsi_min_short:
             # Price is above EMA — short fade setup
             bias = "short"
             level = resist
@@ -126,8 +204,40 @@ class EMAPullbackStrategy(StrategyBase):
         if abs(price - level) > atr * 1.2:
             return None
 
+        # Optional: require bullish/bearish RSI divergence vs prior swing
+        if self.require_rsi_divergence and not self._check_rsi_divergence(df, bias):
+            return None
+
+        # Optional: require rejection candle at the level (pin bar)
+        if self.require_pin_bar and not self._check_pin_bar(df, bias, atr):
+            return None
+
+        # Optional: candle close position — wins close near low (0.24 median), losses near high (0.58)
+        if self.candle_close_pct_max < 1.0:
+            bar = df.iloc[-1]
+            h, l, c = float(bar["High"]), float(bar["Low"]), float(bar["Close"])
+            close_pct = (c - l) / (h - l) if (h - l) > 1e-10 else 0.5
+            if close_pct > self.candle_close_pct_max:
+                return None
+
+        # Optional: skip if CMF shows strong accumulation or distribution (WR 8% / 0%)
+        if self.require_cmf_neutral:
+            cmf = tech.get("cmf_signal", "neutral")
+            if cmf in ("accumulation", "distribution"):
+                return None
+
+        # Optional: skip if stochastic overbought (WR 7% when stoch > 80)
+        if self.require_stoch_not_overbought:
+            if tech.get("stoch_signal") == "overbought":
+                return None
+
+        # Optional: skip if EMA20 > EMA50 > EMA200 alignment (WR 5% in full bull alignment)
+        if self.require_ema_not_bullish:
+            if tech.get("ema_alignment") == "bullish":
+                return None
+
         trade_type   = _interval_trade_type(interval)
-        avg_reward_r = 1.5 * 0.6 + 3.0 * 0.4
+        avg_reward_r = self.tp1_r * (self.tp1_alloc / 100) + self.tp2_r * (self.tp2_alloc / 100)
         ev = _ev(self.win_rate, avg_reward_r)
         pf = _pf(self.win_rate, avg_reward_r)
         buf = atr * 1.5
@@ -139,8 +249,8 @@ class EMAPullbackStrategy(StrategyBase):
             risk       = entry_high - sl
             if risk < 1e-10:
                 return None
-            tp1 = round(entry_high + risk * 1.5, 4)
-            tp2 = round(entry_high + risk * 3.0, 4)
+            tp1 = round(entry_high + risk * self.tp1_r, 4)
+            tp2 = round(entry_high + risk * self.tp2_r, 4)
             if _rr(entry_high, sl, tp1) < self.min_rr:
                 return None
         else:
@@ -150,12 +260,14 @@ class EMAPullbackStrategy(StrategyBase):
             risk       = sl - entry_low
             if risk < 1e-10:
                 return None
-            tp1 = round(entry_low - risk * 1.5, 4)
-            tp2 = round(entry_low - risk * 3.0, 4)
+            tp1 = round(entry_low - risk * self.tp1_r, 4)
+            tp2 = round(entry_low - risk * self.tp2_r, 4)
             if _rr(entry_low, sl, tp1) < self.min_rr:
                 return None
 
-        confidence = min(0.40 + (adx - self.adx_threshold) * 0.004, 0.65)
+        # Coefficient 0.018 → ADX=35 produces confidence=0.706 (just above 0.70 threshold)
+        # Cap at 0.75 keeps all signals in half-Kelly tier — appropriate for bounce strategy.
+        confidence = min(0.40 + (adx - self.adx_threshold) * 0.018, 0.75)
 
         setup = TradingSetup(
             name="Setup A",
@@ -175,8 +287,8 @@ class EMAPullbackStrategy(StrategyBase):
             stop_loss=sl,
             trailing_sl_to_breakeven=tp1,
             targets=[
-                SetupTarget(price=tp1, label="Target 1 (60%)", allocation_pct=60),
-                SetupTarget(price=tp2, label="Target 2 (40%)", allocation_pct=40),
+                SetupTarget(price=tp1, label=f"Target 1 ({self.tp1_alloc}%)", allocation_pct=self.tp1_alloc),
+                SetupTarget(price=tp2, label=f"Target 2 ({self.tp2_alloc}%)", allocation_pct=self.tp2_alloc),
             ],
             rr_ratio=round(avg_reward_r, 2),
             win_rate_estimate=self.win_rate,

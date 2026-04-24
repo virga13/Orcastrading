@@ -18,13 +18,34 @@ venv/
 .venv/
 env/
 
-# Output files
+# Output files (results, reports — regenerate with run_batch_backtest.py)
 outputs/*.json
+outputs/*.csv
+outputs/*.html
+outputs/screenshots/
+outputs/analysis_cache/
+outputs/archive/
 
-# P3 Backtester
+# P3 Backtester cache & results
 p3_backtester/cache/*.json
 p3_backtester/results/*.db
 p3_backtester/results/*.html
+
+# Live journal databases (personal trading data — never commit)
+p4_live/journal/*.db
+p4_live/journal_data/
+
+# Scheduler logs & runtime state
+logs/
+
+# Claude Code assistant files
+.claude/
+
+# Temporary / scratch files
+non_ascii_check.txt
+non_ascii_lines.txt
+orcastrading_task.xml
+todo
 
 # IDE
 .vscode/

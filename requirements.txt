@@ -1,14 +1,39 @@
+# Core data & analysis
 anthropic>=0.40.0
+pandas>=2.0.0
+numpy>=1.26.0
+pandas-datareader>=0.10.0    # Stooq data source
+
+# Market data providers
 yfinance>=0.2.50
+ccxt>=4.0.0                  # crypto (Binance etc.)
+twelvedata>=1.2.0             # Twelve Data API (optional)
+
+# Technical indicators
 ta>=0.11.0
+
+# Macro & news data
 fredapi>=0.5.2
 newsapi-python>=0.2.7
-pydantic>=2.0.0
-python-dotenv>=1.0.0
-rich>=13.0.0
 requests>=2.31.0
-beautifulsoup4>=4.12.0
-schedule>=1.2.0
+
+# Validation & config
+pydantic>=2.0.0
 pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# Scheduling
+schedule>=1.2.0
+
+# UI & visualisation
 streamlit>=1.35.0
 plotly>=5.18.0
+
+# CLI output
+rich>=13.0.0
+
+# Licensing
+py-machineid>=0.3.0
+
+# MT5 execution (Windows only — install manually if using MT5 live trading)
+# MetaTrader5>=5.0.45

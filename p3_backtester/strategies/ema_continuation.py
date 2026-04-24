@@ -78,7 +78,7 @@ class EMAContinuationStrategy(StrategyBase):
 
     def __init__(
         self,
-        ema_period: int = 25,
+        ema_period: int = 20,
         adx_threshold: int = 25,
         pullback_max_atr: float = 1.5,
         min_prior_distance_atr: float = 1.5,
@@ -86,6 +86,11 @@ class EMAContinuationStrategy(StrategyBase):
         use_daily_regime: bool = True,
         win_rate: float = 0.50,
         min_rr: float = 1.4,
+        tp1_r: float = 1.5,
+        tp2_r: float = 3.0,
+        tp1_alloc: int = 60,
+        tp2_alloc: int = 40,
+        atr_pct_max: float = 999.0,  # skip high-vol bars (e.g. 1.2 = skip if ATR > 1.2% of price)
     ):
         self.ema_period              = ema_period
         self.adx_threshold           = adx_threshold
@@ -95,6 +100,11 @@ class EMAContinuationStrategy(StrategyBase):
         self.use_daily_regime        = use_daily_regime
         self.win_rate                = win_rate
         self.min_rr                  = min_rr
+        self.tp1_r                   = tp1_r
+        self.tp2_r                   = tp2_r
+        self.tp1_alloc               = tp1_alloc
+        self.tp2_alloc               = tp2_alloc
+        self.atr_pct_max             = atr_pct_max
 
     @property
     def params(self) -> dict:
@@ -165,6 +175,11 @@ class EMAContinuationStrategy(StrategyBase):
         if adx < self.adx_threshold:
             return None
 
+        # ── Gate 1b: Volatility cap — skip crash/expansion bars ──────────────
+        atr_pct = tech.get("atr_pct", 0.0)
+        if atr_pct > self.atr_pct_max:
+            return None
+
         ema_s = self._get_ema_series(df)
         if ema_s is None:
             return None
@@ -191,13 +206,20 @@ class EMAContinuationStrategy(StrategyBase):
         else:
             return None
 
-        # ── Gate 4: Daily regime filter ───────────────────────────────────────
+        # ── Gate 4: Volume filter — low-volume EMA touches are noise ─────────
+        # Only applies when volume data is available (indices may have Volume=0).
+        vol = float(df["Volume"].iloc[-1])
+        avg_vol = float(df["Volume"].iloc[-21:-1].mean()) if len(df) > 21 else 0.0
+        if avg_vol > 0 and vol < 0.7 * avg_vol:
+            return None
+
+        # ── Gate 5: Daily regime filter ───────────────────────────────────────
         regime = self._daily_regime(df)
         if regime is not None and regime != bias:
             return None   # trading against the daily macro trend — skip
 
         trade_type   = _interval_trade_type(interval)
-        avg_reward_r = 1.5 * 0.6 + 3.0 * 0.4
+        avg_reward_r = self.tp1_r * (self.tp1_alloc / 100) + self.tp2_r * (self.tp2_alloc / 100)
         ev  = _ev(self.win_rate, avg_reward_r)
         pf  = _pf(self.win_rate, avg_reward_r)
         buf = atr * 1.0
@@ -209,8 +231,8 @@ class EMAContinuationStrategy(StrategyBase):
             risk       = entry_high - sl
             if risk < 1e-10:
                 return None
-            tp1 = round(entry_high + risk * 1.5, 4)
-            tp2 = round(entry_high + risk * 3.0, 4)
+            tp1 = round(entry_high + risk * self.tp1_r, 4)
+            tp2 = round(entry_high + risk * self.tp2_r, 4)
             if _rr(entry_high, sl, tp1) < self.min_rr:
                 return None
         else:
@@ -220,8 +242,8 @@ class EMAContinuationStrategy(StrategyBase):
             risk       = sl - entry_low
             if risk < 1e-10:
                 return None
-            tp1 = round(entry_low - risk * 1.5, 4)
-            tp2 = round(entry_low - risk * 3.0, 4)
+            tp1 = round(entry_low - risk * self.tp1_r, 4)
+            tp2 = round(entry_low - risk * self.tp2_r, 4)
             if _rr(entry_low, sl, tp1) < self.min_rr:
                 return None
 
@@ -249,8 +271,8 @@ class EMAContinuationStrategy(StrategyBase):
             stop_loss=sl,
             trailing_sl_to_breakeven=tp1,
             targets=[
-                SetupTarget(price=tp1, label="Target 1 (60%)", allocation_pct=60),
-                SetupTarget(price=tp2, label="Target 2 (40%)", allocation_pct=40),
+                SetupTarget(price=tp1, label=f"Target 1 ({self.tp1_alloc}%)", allocation_pct=self.tp1_alloc),
+                SetupTarget(price=tp2, label=f"Target 2 ({self.tp2_alloc}%)", allocation_pct=self.tp2_alloc),
             ],
             rr_ratio=round(avg_reward_r, 2),
             win_rate_estimate=self.win_rate,
