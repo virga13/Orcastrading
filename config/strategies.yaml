@@ -224,3 +224,911 @@ strategies:
       require_cmf_neutral: false        # off globally — enable per-asset (BTC: true)
       require_stoch_not_overbought: false  # off globally — enable per-asset (BTC: true)
       require_ema_not_bullish: false    # off globally — enable per-asset (BTC: true)
+  gold_scalper:
+    name: Gold Scalper
+    description: BRK Gold Scalper v2 — M30 macro + M15 ADX/EMA signal + M5 entry, composite score gate, ATR-scaled SL/TP
+    default_timeframe: 5m
+    supported_timeframes:
+    - 5m
+    - 15m
+    lookback_days: 10
+    expiry_days: 1
+    class: p3_backtester.strategies.gold_scalper.GoldScalperStrategy
+    signal_conditions: |
+      LONG signal fires when composite bull_score >= min_score (default 6/10):
+        [2] M30 macro: close > EMA50 > EMA200 AND RSI(M30) > 50
+        [2] M15 EMA fresh bull cross (EMA21 crossed above EMA50 on last bar)
+            OR [1] M15 EMA trend aligned (EMA21 > EMA50)
+        [1] RSI(M15) in 45–68 momentum zone
+        [1] M5 EMA8 > EMA21
+        [1] Bullish candle pattern on M5 (pin bar / engulf / marubozu / 3-bar continuation)
+        [1] ADX(M15) >= adx_min AND DI+ > DI-
+        [1] Close > daily VWAP (institutional bias)
+        [1] ATR volatility regime: 0.7 ≤ ATR/ATR_MA50 ≤ 2.0
+
+      SHORT: mirrors LONG with reversed conditions. Only fires when shorts_enabled=true.
+
+      Entry/exit (long):
+        entry_low  = close - 0.1 × ATR   (tight market-order zone)
+        entry_high = close
+        stop_loss  = close - sl_mult × ATR
+        tp1        = close + tp1_mult × ATR  (tp1_alloc% of position, then SL → breakeven)
+        tp2        = close + tp2_mult × ATR  (tp2_alloc% of position, free ride)
+    params:
+      # Optimized 2026-04-29 — 192-combo grid search, 4-year XAU/USD 5m, longs-only
+      # Train 2022-2025 (1226 fills, PF 1.16/1.08 net) | OOS 2025-2026 (734 fills, PF 1.38/1.28 net)
+      # Key changes vs defaults: min_score 6→7, sl_mult 1.5→1.0, tp1_mult 1.0→2.0, tp2_mult 2.5→4.0
+      # Tight SL (1 ATR) + wide TP (2/4 ATR) captures Gold's strong directional follow-through
+      # Shorts disabled: Gold has been in multi-year bull trend; short side loses consistently
+      min_score: 7
+      ema_f5: 8
+      ema_s5: 21
+      ema_f15: 21
+      ema_s15: 50
+      ema_f30: 50
+      ema_s30: 200
+      adx_period: 14
+      adx_min: 22
+      rsi_period: 14
+      rsi_long_min: 45
+      rsi_long_max: 68
+      rsi_short_min: 32
+      rsi_short_max: 55
+      vol_low: 0.7
+      vol_high: 2.0
+      atr_ma_period: 50
+      sl_mult: 1.0
+      tp1_mult: 2.0
+      tp2_mult: 4.0
+      tp1_alloc: 50
+      tp2_alloc: 50
+      sess_start_utc: 8
+      sess_end_utc: 20
+      avoid_friday: true
+      max_trades_per_day: 3
+      use_vwap: true
+      shorts_enabled: false
+      win_rate: 0.37
+  bb_squeeze:
+    name: BB Squeeze
+    description: Bollinger Band Squeeze breakout — BB contracts inside Keltner Channels, then fires when BB expands
+    default_timeframe: 1d
+    supported_timeframes:
+    - 15m
+    - 30m
+    - 1h
+    - 4h
+    - 1d
+    lookback_days: 120
+    expiry_days: 3
+    class: p3_backtester.strategies.bb_squeeze.BBSqueezeStrategy
+    signal_conditions: |
+      LONG signal fires when ALL of the following conditions are met:
+      1. Bollinger Bands (bb_period, bb_std) were fully inside Keltner Channel (kc_period, kc_mult×ATR)
+         for >= min_squeeze_bars consecutive bars (squeeze active)
+      2. Current bar: BB expands OUTSIDE Keltner Channel (squeeze fires/releases)
+      3. Close > BB midline (SMA) → long; close < BB midline → short
+
+      Entry/exit (long):
+        entry      = close of breakout bar (market order)
+        stop_loss  = KC lower band - (sl_buffer_atr × ATR)
+        risk       = entry - stop_loss
+        tp1        = entry + (tp1_r × risk)
+        tp2        = entry + (tp2_r × risk)
+    params:
+      bb_period: 20
+      bb_std: 2.0
+      kc_period: 20
+      kc_mult: 1.5
+      min_squeeze_bars: 5
+      sl_buffer_atr: 0.1
+      tp1_r: 1.5
+      tp2_r: 3.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: true
+      win_rate: 0.45
+  supertrend:
+    name: Supertrend
+    description: Supertrend ATR-based trailing stop crossover with HTF trend filter
+    default_timeframe: 1d
+    supported_timeframes:
+    - 15m
+    - 30m
+    - 1h
+    - 4h
+    - 1d
+    lookback_days: 1825
+    expiry_days: 5
+    class: p3_backtester.strategies.supertrend.SupertrendStrategy
+    signal_conditions: |
+      LONG signal fires when:
+      1. Supertrend indicator (atr_period, multiplier) flips from DOWNTREND to UPTREND
+         (price closes above the upper band on this bar)
+      2. HTF EMA20 > EMA50 (if htf_filter=true)
+
+      SHORT signal: mirrors long with reversed conditions.
+
+      Entry/exit (long):
+        entry      = close on crossover bar
+        stop_loss  = Supertrend line - (sl_buffer_atr × ATR)
+        risk       = entry - stop_loss
+        tp1        = entry + (tp1_r × risk)
+        tp2        = entry + (tp2_r × risk)
+    # Optimized 2026-04-30 — 81-combo grid search, Gold/SPX/BTC/Nasdaq daily 2019-2026
+    # Best consensus: atr_period=10, multiplier=3.0, tp1_r=3.0, tp2_r=7.0
+    # All 4 assets OOS profitable (min OOS Net PF 1.41) — most robust new strategy found
+    # multiplier=3.0 is key: wider band = fewer whipsaws, only catches clean trend flips
+    # tp2_r=7.0: trend-following setups have long follow-through; captured in OOS 2024-2026
+    params:
+      atr_period: 10
+      multiplier: 3.0
+      sl_buffer_atr: 0.05
+      htf_filter: true
+      tp1_r: 3.0
+      tp2_r: 7.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: true
+      win_rate: 0.50
+  macd_crossover:
+    name: MACD Crossover
+    description: MACD signal-line crossover with RSI, volume, and HTF trend filters
+    default_timeframe: 1d
+    supported_timeframes:
+    - 1h
+    - 4h
+    - 1d
+    - 1wk
+    lookback_days: 1825
+    expiry_days: 5
+    class: p3_backtester.strategies.macd_crossover.MACDCrossoverStrategy
+    signal_conditions: |
+      LONG signal fires when ALL of the following conditions are met:
+      1. MACD line (fast-slow EMA diff) crosses ABOVE signal line (EMA of MACD)
+      2. Histogram is positive (confirms crossover direction)
+      3. RSI(rsi_period) <= rsi_max_long (not overbought)
+      4. Volume >= volume_mult × 20-bar avg (if volume_mult > 1.0)
+      5. HTF EMA20 > EMA50 (if htf_filter=true)
+      6. MACD > 0 (if require_above_zero=true — zero-line confirmation)
+
+      SHORT signal: mirrors long with reversed conditions.
+
+      Entry/exit (long):
+        entry      = close on crossover bar
+        stop_loss  = sl_lookback-bar swing low - (sl_buffer_atr × ATR)
+        risk       = entry - stop_loss
+        tp1        = entry + (tp1_r × risk)
+        tp2        = entry + (tp2_r × risk)
+    # Optimized 2026-04-30 — 72-combo grid search, Gold/SPX/BTC/Nasdaq daily 2019-2026
+    # WARNING: only validated OOS on Gold (83% WR OOS, gold bull 2024-2026)
+    # BTC and Nasdaq lose OOS across all combos — do NOT use on crypto/equity indices
+    # Best Gold params: macd_fast=8, macd_slow=21, rsi_max_long=60, tp1_r=3.0, tp2_r=5.0
+    # Faster EMA (8/21 vs 12/26) catches momentum shifts earlier on trending assets
+    params:
+      macd_fast: 8
+      macd_slow: 21
+      macd_signal: 9
+      rsi_period: 14
+      rsi_max_long: 60
+      rsi_min_short: 40
+      require_above_zero: false
+      volume_mult: 1.0
+      htf_filter: true
+      sl_lookback: 10
+      sl_buffer_atr: 0.1
+      tp1_r: 1.5
+      tp2_r: 3.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: true
+      win_rate: 0.45
+  fibonacci_pullback:
+    name: Fibonacci Pullback
+    description: Fibonacci retracement pullback -- enter at 38.2/50/61.8% after a significant trend move
+    default_timeframe: 1d
+    supported_timeframes:
+    - 1h
+    - 4h
+    - 1d
+    - 1wk
+    lookback_days: 120
+    expiry_days: 4
+    class: p3_backtester.strategies.fibonacci_pullback.FibonacciPullbackStrategy
+    signal_conditions: |
+      LONG signal fires when ALL of the following conditions are met:
+      1. Significant upswing in last swing_lookback bars: swing_low -> swing_high, range >= min_swing_atr * ATR
+      2. Current price between swing_low and swing_high (pullback in progress)
+      3. Current price within fib_zone_atr * ATR of a key Fib level (38.2%, 50%, or 61.8%)
+      4. Price > EMA(ema_period) -- overall uptrend confirmed
+      5. ADX >= adx_threshold -- trend strength
+      6. RSI(14) <= rsi_max_long -- not overbought
+      SHORT: mirrors long with reversed conditions.
+      Entry/exit (long):
+        entry = close +/- 0.2 * ATR (at Fib zone)
+        SL    = swing_low - sl_buffer_atr * ATR
+        TP1   = entry + tp1_r * risk
+        TP2   = entry + tp2_r * risk
+    params:
+      swing_lookback: 30
+      min_swing_atr: 3.0
+      fib_zone_atr: 0.5
+      ema_period: 50
+      adx_threshold: 20
+      rsi_max_long: 65
+      rsi_min_short: 35
+      sl_buffer_atr: 0.15
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: true
+      win_rate: 0.45
+  rsi_divergence:
+    name: RSI Divergence
+    description: RSI divergence at swing pivots -- price/RSI disagree, signalling momentum reversal
+    default_timeframe: 1d
+    supported_timeframes:
+    - 1h
+    - 4h
+    - 1d
+    - 1wk
+    lookback_days: 120
+    expiry_days: 4
+    class: p3_backtester.strategies.rsi_divergence.RSIDivergenceStrategy
+    signal_conditions: |
+      LONG (bullish divergence) fires when:
+      1. Two recent pivot lows found (each lower than pivot_order bars on both sides)
+      2. Price at second pivot LOWER than first (lower low)
+      3. RSI at second pivot HIGHER than first (higher low in RSI)
+      4. RSI at second pivot <= rsi_oversold
+      SHORT (bearish divergence): higher price high + lower RSI high + RSI >= rsi_overbought.
+      Entry/exit (long):
+        entry = close on signal bar
+        SL    = min low of last pivot_order*2 bars - sl_buffer_atr * ATR
+        TP1   = entry + tp1_r * risk
+        TP2   = entry + tp2_r * risk
+    params:
+      rsi_period: 14
+      pivot_order: 5
+      lookback: 60
+      rsi_oversold: 45.0
+      rsi_overbought: 55.0
+      max_pivot_gap: 40
+      sl_buffer_atr: 0.15
+      tp1_r: 1.5
+      tp2_r: 3.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: true
+      htf_filter: false
+      win_rate: 0.45
+  inside_bar:
+    name: Inside Bar Breakout
+    description: Inside bar breakout -- consolidation inside a strong mother bar, then trend continuation breakout
+    default_timeframe: 1d
+    supported_timeframes:
+    - 1h
+    - 4h
+    - 1d
+    - 1wk
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.inside_bar.InsideBarStrategy
+    signal_conditions: |
+      LONG signal fires when ALL of the following conditions are met:
+      1. Mother bar (bar[-2]) range >= min_mother_atr * ATR (significant move)
+      2. Current bar is inside bar: high < mother_high AND low > mother_low
+      3. Mother bar is bullish (close > open) [if require_mother_direction=true]
+      4. ADX >= adx_threshold
+      5. RSI(14) <= rsi_max_long
+      6. HTF EMA20 > EMA50 [if htf_filter=true]
+      SHORT: mirrors long with bearish mother bar.
+      Entry/exit (long -- breakout stop):
+        entry_low  = inside_bar_high
+        entry_high = inside_bar_high + entry_buffer_atr * ATR
+        SL         = inside_bar_low - sl_buffer_atr * ATR
+        TP1        = entry_high + tp1_r * risk
+        TP2        = entry_high + tp2_r * risk
+    params:
+      min_mother_atr: 1.0
+      adx_threshold: 20
+      rsi_max_long: 70
+      rsi_min_short: 30
+      require_mother_direction: true
+      htf_filter: true
+      entry_buffer_atr: 0.05
+      sl_buffer_atr: 0.1
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: true
+      win_rate: 0.45
+  donchian_breakout:
+    name: Donchian Channel Breakout
+    description: N-period high/low channel breakout -- Turtle Trading system for trend-following on any asset
+    default_timeframe: 1d
+    supported_timeframes:
+    - 1h
+    - 4h
+    - 1d
+    - 1wk
+    lookback_days: 120
+    expiry_days: 4
+    class: p3_backtester.strategies.donchian_breakout.DonchianBreakoutStrategy
+    signal_conditions: |
+      LONG signal fires when ALL of the following conditions are met:
+      1. Current close > highest high of last entry_period bars (excluding current)
+      2. Breakout distance <= max_breakout_atr * ATR (late-entry filter)
+      3. ADX >= adx_threshold (trending, not choppy)
+      4. HTF EMA20 > EMA50 [if htf_filter=true]
+
+      SHORT: mirrors long with lowest low.
+
+      Entry/exit (long):
+        entry      = close on breakout bar
+        SL         = lowest low of exit_period bars - sl_buffer_atr * ATR
+        TP1        = entry + tp1_r * risk
+        TP2        = entry + tp2_r * risk
+    # Optimized 2026-04-30 — 48-combo grid search, SPX/Gold/US30/Silver/BTC daily 2019-2026
+    # Best SPX result: entry_period=30, adx=15, tp1_r=3.0, tp2_r=5.0
+    # SPX: Train PF=2.18 (n=84) -> OOS PF=2.12 (n=51) WR=43% — most consistent train/OOS this session
+    # US30: OOS PF=1.29 (n=37) | BTC: OOS PF=1.17 (n=39) — both consistent
+    # Gold/Silver: OOS 25x/14x (regime-biased, need 5yr validation through 2022 bear)
+    # adx_threshold=15 key: breakouts can start in moderate trend, 20 was too restrictive
+    # tp2_r=5.0: trend-following breakouts have long follow-through on daily
+    params:
+      entry_period: 30
+      exit_period: 10
+      adx_threshold: 15
+      max_breakout_atr: 1.5
+      sl_buffer_atr: 0.1
+      htf_filter: true
+      tp1_r: 3.0
+      tp2_r: 5.0
+      tp1_alloc: 50
+      tp2_alloc: 50
+      shorts_enabled: true
+      win_rate: 0.40
+  stochastic_bounce:
+    name: Stochastic Bounce
+    description: Stochastic %K/%D cross from oversold/overbought with EMA trend filter
+    default_timeframe: 1d
+    supported_timeframes:
+    - 1h
+    - 4h
+    - 1d
+    - 1wk
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.stochastic_bounce.StochasticBounceStrategy
+    signal_conditions: |
+      LONG signal fires when ALL of the following conditions are met:
+      1. Stochastic %K crosses ABOVE %D (bull cross)
+      2. %K was below oversold_level on the previous bar (originated from oversold zone)
+      3. Price > EMA(ema_period) -- in uptrend
+      4. ADX >= adx_threshold
+
+      SHORT: %K crosses below %D from overbought zone, price < EMA.
+
+      Entry/exit (long):
+        entry = close on cross bar
+        SL    = lowest low of sl_lookback bars - sl_buffer_atr * ATR
+        TP1   = entry + tp1_r * risk
+        TP2   = entry + tp2_r * risk
+    params:
+      stoch_k: 14
+      stoch_d: 3
+      stoch_smooth: 3
+      oversold_level: 20.0
+      overbought_level: 80.0
+      ema_period: 50
+      adx_threshold: 20
+      sl_lookback: 10
+      sl_buffer_atr: 0.15
+      tp1_r: 1.5
+      tp2_r: 3.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: true
+      win_rate: 0.45
+  engulfing_candle:
+    name: Engulfing Candle
+    description: Bullish/bearish engulfing candle near EMA -- trend continuation after pullback
+    default_timeframe: 1d
+    supported_timeframes:
+    - 1h
+    - 4h
+    - 1d
+    - 1wk
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.engulfing_candle.EngulfingCandleStrategy
+    signal_conditions: |
+      LONG (bullish engulfing) fires when ALL of the following conditions are met:
+      1. Previous bar is bearish (close < open)
+      2. Current bar is bullish (close > open) AND body fully engulfs previous body:
+         curr_open <= prev_close AND curr_close >= prev_open
+      3. Price within ema_zone_atr * ATR of EMA(ema_period) -- at the level
+      4. ADX >= adx_threshold
+      5. RSI(14) <= rsi_max_long
+      6. Volume >= volume_mult * 20-bar avg [if volume_mult > 1.0]
+      7. HTF EMA20 > EMA50 [if htf_filter=true]
+
+      SHORT (bearish engulfing): mirrors long.
+
+      Entry/exit (long):
+        entry = close on engulfing bar
+        SL    = low of two-bar pattern - sl_buffer_atr * ATR
+        TP1   = entry + tp1_r * risk
+        TP2   = entry + tp2_r * risk
+    params:
+      ema_period: 20
+      ema_zone_atr: 1.5
+      adx_threshold: 20
+      rsi_max_long: 65
+      rsi_min_short: 35
+      volume_mult: 1.0
+      require_close_above_prev_open: true
+      htf_filter: true
+      sl_buffer_atr: 0.1
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: true
+      win_rate: 0.45
+  heikin_ashi_trend:
+    name: Heikin Ashi Trend
+    description: Consecutive bullish Heikin Ashi bars above EMA with ADX -- trend continuation, no lower wicks
+    default_timeframe: 1d
+    supported_timeframes:
+    - 1h
+    - 4h
+    - 1d
+    - 1wk
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.heikin_ashi_trend.HeikinAshiTrendStrategy
+    signal_conditions: |
+      LONG signal fires when ALL of the following conditions are met:
+      1. Last consecutive_bull_bars Heikin Ashi bars are bullish (HA close > HA open)
+      2. If require_no_lower_wick=true: HA low == HA open on each bar (no lower wicks)
+      3. Price > EMA(ema_period) -- uptrend
+      4. ADX >= adx_threshold
+      5. RSI(14) <= rsi_max_long
+      Entry/exit (long):
+        entry = close + entry_buffer_atr * ATR
+        SL    = min HA low of last ha_sl_lookback bars - sl_buffer_atr * ATR
+        TP1   = entry + tp1_r * risk | TP2 = entry + tp2_r * risk
+    params:
+      consecutive_bull_bars: 3
+      require_no_lower_wick: true
+      ema_period: 50
+      adx_threshold: 20
+      rsi_max_long: 70
+      ha_sl_lookback: 3
+      entry_buffer_atr: 0.05
+      sl_buffer_atr: 0.1
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: false
+      win_rate: 0.45
+  parabolic_sar_flip:
+    name: Parabolic SAR Flip
+    description: Parabolic SAR flips from above-price (bearish) to below-price (bullish) with EMA and ADX gate
+    default_timeframe: 1d
+    supported_timeframes:
+    - 1h
+    - 4h
+    - 1d
+    - 1wk
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.parabolic_sar_flip.ParabolicSARFlipStrategy
+    signal_conditions: |
+      LONG signal fires when ALL of the following conditions are met:
+      1. SAR was above price on bar[-2] (bearish SAR)
+      2. SAR is below price on bar[-1] (bullish SAR) -- flip occurred
+      3. Price > EMA(ema_period) -- in uptrend
+      4. ADX >= adx_threshold
+      5. RSI(14) <= rsi_max_long
+      Entry/exit (long):
+        entry = close (flip bar) | SL = SAR value - sl_buffer_atr * ATR
+        TP1   = entry + tp1_r * risk | TP2 = entry + tp2_r * risk
+    params:
+      sar_step: 0.02
+      sar_max_step: 0.20
+      ema_period: 50
+      adx_threshold: 20
+      rsi_max_long: 70
+      entry_buffer_atr: 0.05
+      sl_buffer_atr: 0.15
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: false
+      win_rate: 0.45
+  williams_r_reversal:
+    name: Williams %R Reversal
+    description: Williams %R oversold cross-up in uptrend with EMA and ADX gate -- momentum reversal
+    default_timeframe: 1d
+    supported_timeframes:
+    - 1h
+    - 4h
+    - 1d
+    - 1wk
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.williams_r_reversal.WilliamsRReversalStrategy
+    signal_conditions: |
+      LONG signal fires when ALL of the following conditions are met:
+      1. Williams %R(wr_period) was <= oversold_level on bar[-2]  (e.g. -80)
+      2. Williams %R crosses above oversold_level on bar[-1]
+      3. Price > EMA(ema_period) -- in uptrend | 4. ADX >= adx_threshold
+      Formula: %R = (HH - Close) / (HH - LL) * -100  (range: -100 to 0)
+      Entry/exit (long):
+        entry = close on cross bar
+        SL    = lowest low of sl_lookback bars - sl_buffer_atr * ATR
+        TP1   = entry + tp1_r * risk | TP2 = entry + tp2_r * risk
+    params:
+      wr_period: 14
+      oversold_level: -80.0
+      overbought_level: -20.0
+      ema_period: 50
+      adx_threshold: 20
+      rsi_max_long: 70
+      sl_lookback: 5
+      entry_buffer_atr: 0.05
+      sl_buffer_atr: 0.1
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: false
+      win_rate: 0.45
+  adx_di_crossover:
+    name: ADX DI Crossover
+    description: ADX DI+/DI- crossover with rising ADX and EMA trend filter -- trend initiation signal
+    default_timeframe: 1d
+    supported_timeframes: [1h, 4h, 1d, 1wk]
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.adx_di_crossover.ADXDICrossoverStrategy
+    signal_conditions: |
+      LONG when: DI+ crosses above DI- AND ADX rising (vs adx_lookback bars ago)
+      AND ADX >= adx_floor AND close > EMA(ema_period) AND RSI <= rsi_max.
+      SL = lowest low of sl_lookback bars - sl_buffer_atr * ATR.
+    params:
+      adx_period: 14
+      adx_floor: 15.0
+      adx_lookback: 3
+      require_rising_adx: true
+      ema_period: 50
+      rsi_max_long: 70
+      sl_lookback: 5
+      entry_buffer_atr: 0.05
+      sl_buffer_atr: 0.1
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: false
+      win_rate: 0.45
+  cci_reversal:
+    name: CCI Reversal
+    description: CCI oversold cross-up in uptrend -- higher signal frequency than Williams %R
+    default_timeframe: 1d
+    supported_timeframes: [1h, 4h, 1d, 1wk]
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.cci_reversal.CCIReversalStrategy
+    signal_conditions: |
+      LONG when: CCI(cci_period) crosses from <= oversold_level to above it
+      AND close > EMA(ema_period) AND ADX >= adx_threshold AND RSI <= rsi_max.
+      SL = lowest low of sl_lookback bars - sl_buffer_atr * ATR.
+    params:
+      cci_period: 20
+      oversold_level: -100.0
+      overbought_level: 100.0
+      ema_period: 50
+      adx_threshold: 20
+      rsi_max_long: 70
+      sl_lookback: 5
+      entry_buffer_atr: 0.05
+      sl_buffer_atr: 0.1
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: false
+      win_rate: 0.45
+  hammer_reversal:
+    name: Hammer Pin Bar Reversal
+    description: Hammer/shooting star rejection candle near EMA support with ADX gate
+    default_timeframe: 1d
+    supported_timeframes: [1h, 4h, 1d, 1wk]
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.hammer_reversal.HammerReversalStrategy
+    signal_conditions: |
+      LONG (hammer): lower_wick >= wick_ratio * range AND body <= max_body_ratio * range
+      AND upper_wick <= max_upper_wick_ratio * range AND close near EMA (within ema_zone_atr)
+      AND ADX >= adx_threshold. Entry = breakout above hammer high.
+      SL = hammer low - sl_buffer_atr * ATR.
+    params:
+      wick_ratio: 0.60
+      max_body_ratio: 0.40
+      max_upper_wick_ratio: 0.25
+      ema_period: 50
+      ema_zone_atr: 2.0
+      adx_threshold: 20
+      rsi_max_long: 70
+      min_bar_atr: 0.5
+      entry_buffer_atr: 0.05
+      sl_buffer_atr: 0.1
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: false
+      win_rate: 0.45
+  ichimoku_cloud:
+    name: Ichimoku Cloud TK Cross
+    description: Ichimoku Tenkan/Kijun cross above the Kumo cloud with ADX gate
+    default_timeframe: 1d
+    supported_timeframes: [1h, 4h, 1d, 1wk]
+    lookback_days: 90
+    expiry_days: 4
+    class: p3_backtester.strategies.ichimoku_cloud.IchimokuCloudStrategy
+    signal_conditions: |
+      LONG when: Tenkan-sen crosses above Kijun-sen AND price above the Kumo cloud
+      AND ADX >= adx_threshold AND RSI <= rsi_max.
+      SL below min(Kijun, cloud bottom) - sl_buffer_atr * ATR.
+    params:
+      tenkan_period: 9
+      kijun_period: 26
+      senkou_b_period: 52
+      require_above_cloud: true
+      adx_threshold: 20
+      rsi_max_long: 70
+      entry_buffer_atr: 0.05
+      sl_buffer_atr: 0.15
+      tp1_r: 2.0
+      tp2_r: 5.0
+      tp1_alloc: 50
+      tp2_alloc: 50
+      shorts_enabled: false
+      win_rate: 0.45
+  triple_ema_cross:
+    name: Triple EMA Cross
+    description: Fast EMA crosses medium EMA while both above slow EMA -- trend continuation
+    default_timeframe: 1d
+    supported_timeframes: [1h, 4h, 1d, 1wk]
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.triple_ema_cross.TripleEMACrossStrategy
+    signal_conditions: |
+      LONG when: EMA(fast) crosses above EMA(medium) AND EMA(medium) > EMA(slow)
+      AND close > EMA(slow) AND ADX >= adx_threshold AND RSI <= rsi_max.
+      SL = EMA(medium) - sl_buffer_atr * ATR.
+    params:
+      ema_fast: 9
+      ema_medium: 21
+      ema_slow: 50
+      adx_threshold: 20
+      rsi_max_long: 70
+      entry_buffer_atr: 0.05
+      sl_buffer_atr: 0.1
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: false
+      win_rate: 0.45
+  bb_bounce:
+    name: Bollinger Band Bounce
+    description: Price bounces from lower BB back above it in uptrend -- pullback mean-reversion entry
+    default_timeframe: 1d
+    supported_timeframes: [1h, 4h, 1d, 1wk]
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.bb_bounce.BBBounceStrategy
+    signal_conditions: |
+      LONG when: previous close <= lower BB AND current close > lower BB
+      AND close > EMA(ema_period) AND ADX >= adx_threshold AND RSI <= rsi_max.
+      SL = lower BB - sl_buffer_atr * ATR. TP1 near middle band.
+    params:
+      bb_period: 20
+      bb_std: 2.0
+      ema_period: 50
+      adx_threshold: 20
+      rsi_max_long: 65
+      require_low_touch: false
+      entry_buffer_atr: 0.05
+      sl_buffer_atr: 0.15
+      tp1_r: 1.5
+      tp2_r: 3.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: false
+      win_rate: 0.45
+
+  roc_momentum:
+    name: ROC Momentum
+    description: Rate of Change zero-line cross-up in uptrend with EMA and ADX gate — momentum resumption
+    default_timeframe: 1d
+    supported_timeframes: [1h, 4h, 1d, 1wk]
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.roc_momentum.ROCMomentumStrategy
+    signal_conditions: |
+      LONG when: ROC(roc_period)[-2] <= 0 AND ROC[-1] > min_roc_pct (zero-line cross up).
+      AND close > EMA(ema_period) AND ADX >= adx_threshold AND RSI <= rsi_max_long.
+      SL = lowest low of sl_lookback bars - sl_buffer_atr * ATR.
+      TP1/TP2 from entry + tp1_r/tp2_r * risk.
+    params:
+      roc_period: 10
+      min_roc_pct: 0.0
+      ema_period: 50
+      adx_threshold: 20
+      rsi_max_long: 70
+      sl_lookback: 5
+      entry_buffer_atr: 0.05
+      sl_buffer_atr: 0.1
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: false
+      win_rate: 0.45
+
+  keltner_breakout:
+    name: Keltner Channel Breakout
+    description: Price closes above upper Keltner Channel (EMA + N*ATR) — momentum expansion entry
+    default_timeframe: 1d
+    supported_timeframes: [1h, 4h, 1d, 1wk]
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.keltner_breakout.KeltnerBreakoutStrategy
+    signal_conditions: |
+      LONG when: close > EMA(ema_period) + atr_mult * ATR(atr_period) (KC upper breakout).
+      Optionally require_fresh_cross=True: prev close must have been inside/below KC upper.
+      AND ADX >= adx_threshold AND RSI <= rsi_max_long.
+      SL = EMA - sl_buffer_atr * ATR (channel mid as invalidation).
+    params:
+      ema_period: 20
+      atr_period: 14
+      atr_mult: 1.5
+      require_fresh_cross: true
+      adx_threshold: 20
+      rsi_max_long: 75
+      entry_buffer_atr: 0.0
+      sl_buffer_atr: 0.2
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: false
+      win_rate: 0.45
+
+  consecutive_highs:
+    name: Consecutive Higher Closes
+    description: N consecutive higher closes above EMA — persistent buying momentum continuation
+    default_timeframe: 1d
+    supported_timeframes: [1h, 4h, 1d, 1wk]
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.consecutive_highs.ConsecutiveHighsStrategy
+    signal_conditions: |
+      LONG when: last N closes are each higher than previous AND close > EMA(ema_period).
+      AND ADX >= adx_threshold AND RSI <= rsi_max_long.
+      Optionally min_gain_pct: total gain over N bars exceeds threshold.
+      SL = lowest low of (N + sl_lookback_extra) bars - sl_buffer_atr * ATR.
+    params:
+      n_bars: 3
+      ema_period: 50
+      adx_threshold: 20
+      rsi_max_long: 70
+      min_gain_pct: 0.0
+      sl_lookback_extra: 2
+      entry_buffer_atr: 0.05
+      sl_buffer_atr: 0.1
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: false
+      win_rate: 0.45
+
+  trix_signal:
+    name: TRIX Signal
+    description: TRIX zero-line cross-up in uptrend — triple-smoothed ROC momentum with fewer whipsaws than ROC
+    default_timeframe: 1d
+    supported_timeframes: [1h, 4h, 1d, 1wk]
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.trix_signal.TRIXSignalStrategy
+    signal_conditions: |
+      LONG when: TRIX(trix_period)[-2] <= 0 AND TRIX[-1] > 0 (zero-line cross).
+      AND close > EMA(ema_period) AND ADX >= adx_threshold AND RSI <= rsi_max_long.
+      TRIX = pct_change of triple-smoothed EMA. Triple smoothing reduces whipsaws vs ROC.
+      SL = lowest low of sl_lookback bars - sl_buffer_atr * ATR.
+    params:
+      trix_period: 9
+      ema_period: 50
+      adx_threshold: 20
+      rsi_max_long: 70
+      sl_lookback: 5
+      entry_buffer_atr: 0.05
+      sl_buffer_atr: 0.1
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: false
+      win_rate: 0.45
+
+  price_channel_retest:
+    name: Price Channel Retest
+    description: Retest entry after N-day high breakout — continuation after pullback to old resistance (now support)
+    default_timeframe: 1d
+    supported_timeframes: [1h, 4h, 1d, 1wk]
+    lookback_days: 90
+    expiry_days: 3
+    class: p3_backtester.strategies.price_channel_retest.PriceChannelRetestStrategy
+    signal_conditions: |
+      LONG when: price broke above N-day channel high within last retest_window bars,
+      then pulled back to within retest_atr_zone * ATR of that level,
+      and current close re-cleared the level.
+      AND close > EMA(ema_period) AND ADX >= adx_threshold.
+      SL = breakout_high - sl_buffer_atr * ATR (tight — just below the retest level).
+    params:
+      lookback_period: 20
+      retest_window: 10
+      retest_atr_zone: 1.0
+      ema_period: 50
+      adx_threshold: 15
+      rsi_max_long: 70
+      entry_buffer_atr: 0.05
+      sl_buffer_atr: 0.15
+      tp1_r: 2.0
+      tp2_r: 5.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: false
+      win_rate: 0.45
+
+  keltner_breakout:
+    name: Keltner Channel Breakout
+    description: Price closes above upper Keltner Channel (EMA + N*ATR) — momentum expansion entry
+    default_timeframe: 1d
+    supported_timeframes: [1h, 4h, 1d, 1wk]
+    lookback_days: 60
+    expiry_days: 3
+    class: p3_backtester.strategies.keltner_breakout.KeltnerBreakoutStrategy
+    signal_conditions: |
+      LONG when: close > EMA(ema_period) + atr_mult * ATR(atr_period) (KC upper breakout).
+      Optionally require_fresh_cross=True: prev close must have been inside/below KC upper.
+      AND ADX >= adx_threshold AND RSI <= rsi_max_long.
+      SL = EMA - sl_buffer_atr * ATR (channel mid as invalidation).
+      NOTE: Baseline showed weak/inconsistent results on daily. Parked — may work intraday.
+    params:
+      ema_period: 20
+      atr_period: 14
+      atr_mult: 1.5
+      require_fresh_cross: true
+      adx_threshold: 20
+      rsi_max_long: 75
+      entry_buffer_atr: 0.0
+      sl_buffer_atr: 0.2
+      tp1_r: 2.0
+      tp2_r: 4.0
+      tp1_alloc: 60
+      tp2_alloc: 40
+      shorts_enabled: false
+      win_rate: 0.45

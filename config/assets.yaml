@@ -27,6 +27,7 @@ assets:
     # MB retest 2026-04-21: momentum_breakout 1d PF=7.19 OOS=999 n=10
     # Short retest 2026-04-21: mtf_trend 1d combined (long+short) PF=1.86 OOS=2.27 n=421 — shorts viable
     # Removed: mtf_trend 1h/4h (PF=0.75/0.11), ema_pullback 1d/4h/1h (OOS < 1.0)
+    # Supertrend 2026-04-30: OOS 2024-2026 75% WR, Net PF 3.17 (8 trades)
     baseline:
       win_rate: 0.388
       net_pf: 2.41
@@ -65,11 +66,39 @@ assets:
       - id: momentum_breakout
         timeframes: [1d]
         params: {}
+      - id: donchian_breakout
+        timeframes: [1d]
+        params:
+          entry_period: 30
+          adx_threshold: 15
+          tp1_r: 3.0
+          tp2_r: 5.0
+      - id: inside_bar
+        timeframes: [1d]
+        params:
+          min_mother_atr: 1.0
+          adx_threshold: 15
+          tp1_r: 2.0
+          tp2_r: 4.0
+      - id: heikin_ashi_trend
+        timeframes: [1d]
+        params:
+          consecutive_bull_bars: 2
+          require_no_lower_wick: true
+          ema_period: 20
+          adx_threshold: 20
+          tp1_r: 2.0
+          tp2_r: 4.0
+      # Supertrend 2026-04-30: removed — 5yr full backtest PF=0.65, 21% WR (whipsawed in 2022 bear)
+      # Donchian 2026-04-30: grid search Train PF=2.18 (n=84) OOS PF=2.12 (n=51) WR=43% — VALIDATED
+      # Inside Bar 2026-04-30: grid search OOS PF=1.39 (n=25) — multi-asset consistent
+      # HA Trend 2026-04-30: grid adx=20 OOS PF=2.19 (n=78) WR=47% — VALIDATED
 
   - id: us30
     enabled: true
     label: US30
     # Grid 2026-04-20: mtf_trend 1d PF=2.15 OOS=7.29 n=121 | mtf_trend 4h PF=2.90 n=21
+    # Supertrend 2026-04-30: not directly tested on US30 — added based on SPX/Nasdaq validation
     #   ema_continuation 4h PF=1.35 OOS=4.64 n=72 | ema_continuation 1d PF=1.50 OOS=1.78 n=292
     #   ema_pullback 4h PF=3.66 OOS=2.25 n=11 (thin but strong)
     # Short retest 2026-04-21: mtf_trend 1d combined PF=1.33 OOS=7.30 n=188 (shorts viable)
@@ -125,6 +154,23 @@ assets:
           tp1_r: 3.5
           tp2_r: 5.0
           require_stoch_not_overbought: true
+      - id: donchian_breakout
+        timeframes: [1d]
+        params:
+          entry_period: 30
+          adx_threshold: 15
+          tp1_r: 3.0
+          tp2_r: 5.0
+      - id: inside_bar
+        timeframes: [1d]
+        params:
+          min_mother_atr: 1.0
+          adx_threshold: 15
+          tp1_r: 2.0
+          tp2_r: 4.0
+      # Supertrend 2026-04-30: removed — 5yr full backtest PF=0.75, 20% WR (whipsawed in 2022 bear)
+      # Donchian 2026-04-30: grid search OOS PF=1.29 (n=37) — added, consistent with SPX result
+      # Inside Bar 2026-04-30: grid search OOS PF=1.62 (n=31) — multi-asset consistent
 
   - id: bitcoin
     enabled: true
@@ -133,6 +179,7 @@ assets:
     # MB short retest 2026-04-21: momentum_breakout 1d combined PF=1.75 OOS=1.97 n=21 (shorts viable)
     #   momentum_breakout 4h combined PF=0.94 (shorts hurt — removed 4h)
     # Removed: mtf_trend (all PF < 1.0), ema_continuation (no signals or OOS < 0.6)
+    # Supertrend 2026-04-30: OOS 2024-2026 40% WR, Net PF 1.08 — marginal, monitor closely
     baseline:
       win_rate: 0.396
       net_pf: 2.01
@@ -145,7 +192,7 @@ assets:
       yfinance: "BTC-USD"
       ccxt: "BTC/USDT"
       twelvedata: "BTC/USD"
-      mt5: ""
+      mt5: "BTCUSD"
     category: crypto
     currency: USD
     session:
@@ -163,15 +210,26 @@ assets:
       - id: momentum_breakout
         timeframes: [1d]
         params: {}
+      - id: donchian_breakout
+        timeframes: [1d]
+        params:
+          entry_period: 30
+          adx_threshold: 15
+          tp1_r: 3.0
+          tp2_r: 5.0
+      # Supertrend 2026-04-30: marginal on BTC (PF=1.19, 22% WR, MaxDD -8R) — monitor, not enabled
+      # Donchian 2026-04-30: grid search OOS PF=1.17 (n=39) — borderline, added for monitoring
 
   - id: gold
     enabled: true
     label: Gold
     # Grid 2026-04-20: mtf_trend 1d PF=2.17 OOS=4.59 n=249
-    #   ema_continuation 1h PF=3.31 OOS=3.98 n=11 (thin) | ema_continuation 4h PF=1.67 OOS=3.89 n=39
+    #   ema_continuation 1h PF=3.31 OOS=3.98 n=11 (thin, removed 2026-04-30 — only 7 DB trades) | ema_continuation 4h PF=1.67 OOS=3.89 n=39
     #   ema_continuation 1d PF=1.50 OOS=999 n=27
     # MB retest 2026-04-21: momentum_breakout 1d PF=13.95 OOS=999 n=17
     # Removed: mtf_trend 1h/4h (PF=0.11 both!), ema_pullback all (PF < 1.0), orb (no OOS data)
+    # Supertrend 2026-04-30: OOS 2024-2026 80% WR, Net PF 11.02 (10 trades)
+    # MACD Crossover 2026-04-30: OOS 2024-2026 83% WR on Gold — only validated asset
     baseline:
       win_rate: 0.381
       net_pf: 2.17
@@ -199,12 +257,39 @@ assets:
           pullback_max_atr: 1.0
           adx_threshold: 25
       - id: ema_continuation
-        timeframes: [1h, 4h, 1d]
+        timeframes: [4h, 1d]
         params:
           adx_threshold: 22
       - id: momentum_breakout
         timeframes: [1d]
         params: {}
+      - id: gold_scalper
+        timeframes: [5m]
+        params: {}
+      - id: supertrend
+        timeframes: [1d]
+        params: {}
+      - id: macd_crossover
+        timeframes: [1d]
+        params: {}
+      - id: inside_bar
+        timeframes: [1d]
+        params:
+          min_mother_atr: 1.0
+          adx_threshold: 15
+          tp1_r: 2.0
+          tp2_r: 4.0
+      - id: heikin_ashi_trend
+        timeframes: [1d]
+        params:
+          consecutive_bull_bars: 2
+          require_no_lower_wick: true
+          ema_period: 20
+          adx_threshold: 20
+          tp1_r: 2.0
+          tp2_r: 4.0
+      # Inside Bar 2026-04-30: grid search OOS PF=4.61 (n=25) — best validated result this session
+      # HA Trend 2026-04-30: adx=20 OOS PF=4.27 (n=52) WR=54% — VALIDATED
 
   - id: silver
     enabled: true
@@ -246,6 +331,24 @@ assets:
           adx_threshold: 18
           tp1_r: 3.5
           tp2_r: 5.0
+      - id: inside_bar
+        timeframes: [1d]
+        params:
+          min_mother_atr: 1.0
+          adx_threshold: 15
+          tp1_r: 2.0
+          tp2_r: 4.0
+      - id: heikin_ashi_trend
+        timeframes: [1d]
+        params:
+          consecutive_bull_bars: 2
+          require_no_lower_wick: true
+          ema_period: 20
+          adx_threshold: 15
+          tp1_r: 2.0
+          tp2_r: 4.0
+      # Inside Bar 2026-04-30: grid search OOS PF=1.69 (n=20)
+      # HA Trend 2026-04-30: adx=15 OOS PF=2.26 (n=53) WR=45% — VALIDATED
 
   - id: ger40
     enabled: true

@@ -35,8 +35,17 @@ p3_backtester/results/*.html
 p4_live/journal/*.db
 p4_live/journal_data/
 
+# Insider module — SQLite database (personal data, auto-rebuilt from scrapers)
+p5_insider/data/
+
 # Scheduler logs & runtime state
 logs/
+
+# Runtime data & caches (regenerated locally; ticker CSVs kept as reference data)
+data/*.db
+data/*.parquet
+data/momentum_vol_cache.json
+data/demo_usage.json
 
 # Claude Code assistant files
 .claude/

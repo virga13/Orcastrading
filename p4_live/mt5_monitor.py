@@ -258,6 +258,56 @@ def sync_mt5_positions(dry_run: bool = False) -> list[dict]:
     return updates
 
 
+# ── Cancel MT5 orders for journal-expired trades ──────────────────────────────
+
+def cancel_pending_for_expired(lookback_days: int = 14) -> list[dict]:
+    """
+    Cancel any live MT5 pending orders whose journal trade was marked 'expired'.
+
+    The monitor's sync_mt5_positions() only processes status IN ('pending','filled'),
+    so when expire_stale_signals() flips a trade to 'expired', the MT5 limit orders
+    become invisible to the monitor and can fill silently, creating ghost positions.
+
+    This function plugs that gap: it queries recently expired trades with MT5 tickets,
+    checks whether each ticket is still a pending order in MT5, and cancels it.
+
+    dry_run is not needed here — cancelling a non-existent order is a no-op in MT5.
+
+    Returns list of action dicts (one per cancel attempted).
+    """
+    from p4_live import mt5_broker as broker
+    from p4_live.journal import get_expired_with_tickets
+
+    if not broker.is_enabled():
+        return []
+
+    updates: list[dict] = []
+    expired_trades = get_expired_with_tickets(lookback_days=lookback_days)
+
+    for t in expired_trades:
+        tickets = _parse_tickets(t.get("mt5_ticket") or "")
+        for ticket in tickets:
+            state = broker.get_order_state(ticket)
+            if state is None:
+                continue   # already cancelled/filled/expired by MT5 itself
+            ok = broker.cancel_order(ticket)
+            log.info(
+                f"Cancel expired MT5 order: ticket={ticket}  "
+                f"{t['ticker']} {t['direction']} [{t['strategy']}]  "
+                f"signal={t['signal_date']}  {'OK' if ok else 'FAILED'}"
+            )
+            updates.append({
+                "ticker":      t["ticker"],
+                "strategy":    t["strategy"],
+                "timeframe":   t.get("timeframe", "1d"),
+                "signal_date": t["signal_date"],
+                "ticket":      ticket,
+                "cancelled":   ok,
+            })
+
+    return updates
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _today_str() -> str:

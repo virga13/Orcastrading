@@ -26,6 +26,7 @@ import os
 import json
 import logging
 import schedule
+import threading
 import time
 from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
@@ -99,8 +100,19 @@ def _at_bar_boundary(bar_minutes: int = 15, window_secs: int = 90) -> bool:
 
 # ── MT5: execute a signal and store tickets in journal ────────────────────────
 
+_MT5_CONFIDENCE_THRESHOLD = 0.70
+
+
 def _execute_mt5(result: dict) -> None:
     """Place MT5 pending orders for a fired signal and record the tickets."""
+    confidence = result.get("confidence") or 0.0
+    if confidence < _MT5_CONFIDENCE_THRESHOLD:
+        log.info(
+            f"  MT5 skipped: {result.get('label', result.get('ticker', ''))} "
+            f"[{result.get('strategy', '')}] confidence {confidence:.0%} "
+            f"< {_MT5_CONFIDENCE_THRESHOLD:.0%} threshold"
+        )
+        return
     try:
         from p4_live import mt5_broker
         if not mt5_broker.is_enabled():
@@ -127,13 +139,59 @@ def _execute_mt5(result: dict) -> None:
 
 # ── MT5: sync open positions back into journal ────────────────────────────────
 
+def _retry_pending_mt5_orders() -> None:
+    """
+    Re-attempt MT5 order placement for pending journal trades that have no ticket.
+    This handles signals that fired while the market was closed (retcode=10018).
+    Called on every MT5 monitor cycle (every 60 s) until the market reopens.
+    """
+    try:
+        from p4_live import mt5_broker
+        from p4_live.journal import get_pending_without_ticket, record_mt5_ticket
+
+        pending = get_pending_without_ticket()
+        if not pending:
+            return
+
+        for trade in pending:
+            signal = {
+                "ticker":     trade["ticker"],
+                "strategy":   trade["strategy"],
+                "timeframe":  trade.get("timeframe", "1d"),
+                "direction":  trade["direction"],
+                "entry_low":  trade["entry_low"],
+                "entry_high": trade["entry_high"],
+                "stop_loss":  trade["stop_loss"],
+                "tp1":        trade["tp1"],
+                "tp2":        trade.get("tp2"),
+                "tp1_alloc":  trade.get("tp1_alloc", 70),
+                "tp2_alloc":  trade.get("tp2_alloc", 30),
+                "risk_pts":   trade.get("risk_pts"),
+                "signal_date": trade["signal_date"],
+            }
+            tickets = mt5_broker.execute_signal(signal)
+            if tickets:
+                record_mt5_ticket(
+                    trade["signal_date"], trade["ticker"],
+                    trade["strategy"], trade.get("timeframe", "1d"),
+                    tickets,
+                )
+                log.info(
+                    f"  MT5 retry OK: {trade.get('label', trade['ticker'])} "
+                    f"[{trade['strategy']}@{trade.get('timeframe','1d')}] "
+                    f"tickets={tickets}"
+                )
+    except Exception as e:
+        log.error(f"MT5 order retry failed: {e}", exc_info=True)
+
+
 def _run_mt5_monitor() -> None:
     """Poll MT5 terminal for fills/closes and write them to the journal."""
     try:
         from p4_live import mt5_broker
         if not mt5_broker.is_enabled():
             return
-        from p4_live.mt5_monitor import sync_mt5_positions
+        from p4_live.mt5_monitor import sync_mt5_positions, cancel_pending_for_expired
         updates = sync_mt5_positions()
         if updates:
             fills   = sum(1 for u in updates if u.get("status") == "filled")
@@ -141,6 +199,12 @@ def _run_mt5_monitor() -> None:
                          ("win", "loss", "partial_win", "breakeven"))
             expired = sum(1 for u in updates if u.get("status") == "expired")
             log.info(f"MT5 monitor: {fills} filled, {closed} closed, {expired} expired")
+        # Cancel any MT5 limit orders left open after the journal expired the signal.
+        # Prevents ghost fills on trades the journal considers dead.
+        cancelled = cancel_pending_for_expired()
+        if cancelled:
+            log.info(f"MT5 monitor: cancelled {len(cancelled)} order(s) for expired signals")
+        _retry_pending_mt5_orders()
     except Exception as e:
         log.error(f"MT5 monitor error: {e}", exc_info=True)
 
@@ -301,6 +365,129 @@ def _run_scan(label: str, timeframe_filter: list[str] | None = None) -> tuple[li
     return fired_signals, checked
 
 
+# ── Missed-signal replay helpers ─────────────────────────────────────────────
+
+def _is_signal_stale(result: dict, current_bar: dict | None) -> tuple[bool, str]:
+    """
+    True when a replayed signal is no longer actionable at the current price.
+    The only unambiguous invalidation is an SL breach: if price has already
+    traded through the stop level, the setup is structurally broken regardless
+    of how it was generated.  Signals that are merely "not yet triggered" (entry
+    zone not yet touched) are left as pending and will expire via expire_stale_signals().
+    """
+    if current_bar is None:
+        return False, ""
+    price = current_bar["close"]
+    if result["direction"] == "long":
+        if price <= result["stop_loss"]:
+            return True, f"price {price:,.2f} already at/below SL {result['stop_loss']:,.2f}"
+    else:
+        if price >= result["stop_loss"]:
+            return True, f"price {price:,.2f} already at/above SL {result['stop_loss']:,.2f}"
+    return False, ""
+
+
+def _run_replay_scan(label: str, replay_date, timeframe_filter: list[str]) -> list[dict]:
+    """
+    Re-run the scanner as-of a past date, then drop any signals whose stop-loss
+    has already been breached by the current price.  Valid signals are recorded
+    with source='replay' and an explanatory note, then alerted normally.
+
+    Only 1d timeframes are replayed — intraday bars expire too fast to be worth it.
+    """
+    from datetime import date as _date
+    from p4_live.scanner import scan_strategy, _fetch_latest_bar
+    from p4_live.journal import record_signal, get_active_strategy_set
+    from p4_live.alerts import alert_signal
+    from core.config import get_watchlist
+
+    log.info(f"{label} — replaying bar {replay_date}...")
+    fired: list[dict] = []
+
+    watchlist = get_watchlist()
+    if timeframe_filter:
+        watchlist = [(a, s, tf) for a, s, tf in watchlist if tf in timeframe_filter]
+
+    active       = get_active_strategy_set()
+    open_tickers: list[str] = []
+
+    # Cache current bars so we only fetch each ticker once
+    current_bars: dict[str, dict | None] = {}
+
+    for asset_id, strategy_id, timeframe in watchlist:
+        try:
+            result = scan_strategy(
+                asset_id, strategy_id, timeframe=timeframe, as_of=replay_date
+            )
+        except Exception as e:
+            log.warning(f"  Replay {asset_id}/{strategy_id}/{timeframe} @ {replay_date}: {e}")
+            continue
+
+        if not result.get("fired"):
+            continue
+
+        ticker = result["ticker"]
+        if (ticker, strategy_id) in active:
+            log.info(
+                f"  {result['label']:8} [{strategy_id}@{timeframe}] "
+                f"replay skipped — trade already open"
+            )
+            continue
+
+        if ticker not in current_bars:
+            current_bars[ticker] = _fetch_latest_bar(ticker)
+
+        stale, reason = _is_signal_stale(result, current_bars[ticker])
+        if stale:
+            log.info(
+                f"  {result['label']:8} [{strategy_id}@{timeframe}] "
+                f"REPLAY STALE (bar={replay_date}) — {reason}"
+            )
+            continue
+
+        result["notes"]  = f"replayed from {replay_date} (scheduler was offline)"
+        result["source"] = "replay"
+        result["rationale"] = f"[Replayed {replay_date}] " + (result.get("rationale") or "")
+
+        recorded = record_signal(result)
+        if recorded:
+            log.info(
+                f"  {result['label']:8} [{strategy_id}@{timeframe}] REPLAY SIGNAL "
+                f"{result['direction'].upper()} "
+                f"entry {result['entry_low']:,.2f}–{result['entry_high']:,.2f} "
+                f"(original bar={replay_date})"
+            )
+            alert_signal(result, open_positions=open_tickers)
+            _execute_mt5(result)
+            active.add((ticker, strategy_id))
+            if ticker not in open_tickers:
+                open_tickers.append(ticker)
+            fired.append(result)
+        else:
+            log.info(
+                f"  {result['label']:8} [{strategy_id}@{timeframe}] "
+                f"replay already in journal"
+            )
+
+    log.info(f"{label} — {len(fired)} replayed signal(s) still valid")
+    _run_simulate()
+    return fired
+
+
+# ── 5m scan: gold scalper and other 5m strategies ────────────────────────────
+
+def run_5m_scan():
+    """5m bar scan — fires every 5 min but only during the intraday window.
+    Covers gold_scalper and any other 5m strategies in the watchlist."""
+    if not _within_intraday_window():
+        return
+    if not _at_bar_boundary(bar_minutes=5, window_secs=45):
+        log.debug("5m scan skipped — not at a 5m bar boundary")
+        return
+    _run_scan("Intraday (5m)", timeframe_filter=["5m"])
+    _write_last_run("5m")
+
+
 # ── Intraday scan: 15m bars during US session open ────────────────────────────
 
 def run_intraday_scan():
@@ -311,7 +498,7 @@ def run_intraday_scan():
     if not _at_bar_boundary():
         log.debug("15m scan skipped — not at a bar boundary")
         return
-    _run_scan("Intraday (15m)", timeframe_filter=["15m"])  # return value unused
+    _run_scan("Intraday (15m)", timeframe_filter=["15m"])
     _write_last_run("15m")
 
 
@@ -352,17 +539,18 @@ def run_daily_scan():
     """
     fired_signals, _checked = _run_scan("Daily (1d)", timeframe_filter=["1d"])
 
-    # ── Auto-expire stale pending signals (1d strategies only) ───────────────
+    # ── Auto-expire stale pending signals (all active strategies) ────────────
     try:
-        from core.config import get_strategy_config
+        from core.config import get_watchlist, get_strategy_config
         from p4_live.journal import expire_stale_signals
         expiry_map = {}
-        for sid in ["mtf_trend", "momentum_breakout", "ema_continuation", "ema_pullback"]:
-            try:
-                cfg = get_strategy_config(sid)
-                expiry_map[sid] = cfg.get("expiry_days", 5)
-            except Exception:
-                pass
+        for _, sid, _ in get_watchlist():
+            if sid not in expiry_map:
+                try:
+                    cfg = get_strategy_config(sid)
+                    expiry_map[sid] = cfg.get("expiry_days", 5)
+                except Exception:
+                    pass
         expired_n = expire_stale_signals(expiry_map)
         if expired_n:
             log.info(f"Auto-expired {expired_n} stale pending signal(s)")
@@ -499,9 +687,113 @@ def _run_catchup() -> None:
         log.info(f"Catch-up: 4h/1h OK (last ran {h4_last:%Y-%m-%d %H:%M})")
 
     if _within_intraday_window():
-        log.info("Catch-up: inside intraday window — running 15m scan once")
+        log.info("Catch-up: inside intraday window — running 5m + 15m scans once")
+        _run_scan("Intraday (5m) [catch-up]", timeframe_filter=["5m"])
+        _write_last_run("5m")
         _run_scan("Intraday (15m) [catch-up]", timeframe_filter=["15m"])
         _write_last_run("15m")
+
+    # ── Replay missed 1d bar closes ───────────────────────────────────────────
+    # If the scheduler was offline for N days, the daily closes that occurred
+    # during that window were never evaluated.  Replay each one (oldest first),
+    # drop any signal whose stop-loss has since been breached, and record the
+    # rest so they can still fill normally.  Capped at 7 days to avoid flooding
+    # after a long outage; 15m/5m bars are skipped (intraday entries expire fast).
+    if daily_last is not None:
+        days_missed = max(0, (now.date() - daily_last.date()).days - 1)
+        days_missed = min(days_missed, 7)
+        if days_missed > 0:
+            log.info(f"Catch-up: {days_missed} missed daily close(s) — replaying...")
+            for d in range(days_missed, 0, -1):   # oldest → newest
+                missed_date = now.date() - timedelta(days=d)
+                _run_replay_scan(f"Replay 1d [{missed_date}]", missed_date, ["1d"])
+        else:
+            log.info("Catch-up: no missed daily closes to replay")
+
+
+# ── US market hours guard (for momentum scanner) ─────────────────────────────
+
+def _within_us_market_hours() -> bool:
+    """True during the regular US equity session (9:25–16:05 ET, Mon–Fri)."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import time as _t
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        return (
+            now_et.weekday() < 5
+            and _t(9, 25) <= now_et.time() <= _t(16, 5)
+        )
+    except Exception:
+        return False
+
+
+# ── Momentum scan: Russell 2000 price/volume burst detection ──────────────────
+
+def run_momentum_scan() -> None:
+    """
+    Scan the full Russell 2000 for sudden price/volume moves.
+    Runs every 5 minutes but only executes during US market hours (9:30–16:00 ET).
+    Fires Telegram alerts when thresholds are breached.
+    """
+    if not _within_us_market_hours():
+        return
+    try:
+        from p5_insider.momentum_scanner import scan_momentum, send_momentum_alerts
+        signals = scan_momentum()
+        if signals:
+            n = send_momentum_alerts(signals)
+            log.info(f"Momentum: {len(signals)} signal(s), {n} alert(s) sent")
+    except Exception as e:
+        log.error(f"Momentum scan failed: {e}", exc_info=True)
+    _write_last_run("momentum")
+
+
+# ── Insider data refresh ──────────────────────────────────────────────────────
+
+def run_insider_refresh() -> None:
+    """
+    Fetch latest congressional + Form 4 insider trades, store new records,
+    and send alerts for any that match the user's portfolio (score >= 5).
+    """
+    try:
+        from p5_insider.scrapers.congress import refresh as congress_refresh
+        from p5_insider.scrapers.sec_form4 import refresh as form4_refresh
+        from p5_insider.alerts import send_new_alerts
+
+        c = congress_refresh()
+        f = form4_refresh()
+        n_alerts = send_new_alerts(since_days=7)
+        log.info(
+            f"Insider refresh done — "
+            f"congress: +{c['house']}H +{c['senate']}S, "
+            f"form4: +{f}, alerts: {n_alerts}"
+        )
+    except Exception as e:
+        log.error(f"Insider refresh failed: {e}", exc_info=True)
+
+
+# ── Trump Truth Social monitor (background thread) ───────────────────────────
+
+def _trump_monitor_thread() -> None:
+    """
+    Runs trump_monitor.run() in a daemon thread.
+    Restarts automatically if it crashes, with a 30-second back-off.
+    """
+    import trump_monitor
+    interval   = float(os.getenv("TRUMP_POLL_INTERVAL", "2"))
+    no_telegram = os.getenv("TRUMP_NO_TELEGRAM", "").lower() in ("1", "true", "yes")
+    while True:
+        try:
+            trump_monitor.run(interval=interval, use_telegram=not no_telegram)
+        except Exception as e:
+            log.error(f"Trump monitor crashed: {e} — restarting in 30s", exc_info=True)
+            time.sleep(30)
+
+
+def start_trump_monitor() -> None:
+    t = threading.Thread(target=_trump_monitor_thread, name="trump-monitor", daemon=True)
+    t.start()
+    log.info("Trump monitor started (background thread, daemon)")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -545,6 +837,9 @@ def main():
         log.error(f"MT5 startup error: {e}")
 
     # ── Schedule ──────────────────────────────────────────────────────────────
+    schedule.every(5).minutes.do(run_5m_scan)
+    log.info(f"Scheduled: 5m scan every 5 min (active {INTRADAY_START:%H:%M}–{INTRADAY_END:%H:%M} local, covers gold_scalper)")
+
     schedule.every(15).minutes.do(run_intraday_scan)
     log.info(f"Scheduled: 15m intraday scan every 15 min (active {INTRADAY_START:%H:%M}–{INTRADAY_END:%H:%M} local)")
 
@@ -557,8 +852,16 @@ def main():
     schedule.every().day.at("22:00").do(run_daily_scan)
     log.info("Scheduled: daily 1d scan at 22:00 local")
 
+    schedule.every(5).minutes.do(run_momentum_scan)
+    log.info("Scheduled: momentum scan every 5 min (active during US market hours 09:30–16:00 ET)")
+
+    schedule.every(6).hours.do(run_insider_refresh)
+    log.info("Scheduled: insider data refresh every 6 hours")
+
     schedule.every(1).minutes.do(_run_mt5_monitor)
     log.info("Scheduled: MT5 position monitor every 60 s")
+
+    start_trump_monitor()
 
     log.info("Scheduler running. Press Ctrl+C to stop.")
     log.info("-" * 60)

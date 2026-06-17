@@ -13,6 +13,11 @@ class StrategyBase(ABC):
     name: str = "unnamed"
     description: str = ""
 
+    # Set to False for strategies that compute all their own indicators from df
+    # and do not use the tech dict from bar_slicer.recompute_technical().
+    # When False, run_pass1 skips recompute_technical() — O(n²) → O(1) per bar.
+    uses_bar_slicer: bool = True
+
     @property
     def params(self) -> dict:
         return {}

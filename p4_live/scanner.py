@@ -31,6 +31,8 @@ def _build_asset_list() -> list[dict]:
     from core.config import get_all_assets
     result = []
     for a in get_all_assets():
+        if not a.get("enabled", True):
+            continue
         yf = a.get("tickers", {}).get("yfinance")
         if not yf:
             continue

@@ -236,17 +236,17 @@ _PL = dict(
 )
 
 # ── Cached loaders ────────────────────────────────────────────────────────────
-@st.cache_data(ttl=30)
 def _trades():
-    from p4_live.journal import get_all_trades; return get_all_trades()
+    from p4_live.journal_supabase import get_all_trades
+    return get_all_trades(st.session_state["supabase_client"])
 
-@st.cache_data(ttl=30)
 def _manual_entries():
-    from p4_live.journal import get_manual_entries; return get_manual_entries()
+    from p4_live.journal_supabase import get_manual_entries
+    return get_manual_entries(st.session_state["supabase_client"])
 
-@st.cache_data(ttl=30)
 def _psychology_all():
-    from p4_live.journal import get_all_psychology; return get_all_psychology()
+    from p4_live.journal_supabase import get_all_psychology
+    return get_all_psychology(st.session_state["supabase_client"])
 
 @st.cache_data(ttl=120)
 def _assets():
@@ -294,7 +294,7 @@ def _render_chart_upload(t: dict, upload_key: str) -> None:
     Show chart screenshot for a live trade, with an upload widget to add/replace it.
     Screenshot is saved to outputs/screenshots/ and path persisted in the journal DB.
     """
-    from p4_live.journal import save_trade_chart_screenshot
+    from p4_live.journal_supabase import save_trade_chart_screenshot
     ss_dir = ROOT / "outputs" / "screenshots"
     ss_dir.mkdir(parents=True, exist_ok=True)
 
@@ -316,6 +316,7 @@ def _render_chart_upload(t: dict, upload_key: str) -> None:
         save_path = ss_dir / f"{ts_s}_trade_{t['signal_date']}_{t['ticker']}_{uploaded.name}"
         save_path.write_bytes(uploaded.getvalue())
         save_trade_chart_screenshot(
+            st.session_state["supabase_client"],
             t["signal_date"], t["ticker"],
             t.get("strategy", "mtf_trend"), t.get("timeframe", "1d"),
             str(save_path),
@@ -342,7 +343,7 @@ _LIVE_TO_YF = {
 }
 
 def _clear():
-    _trades.clear(); _manual_entries.clear(); _psychology_all.clear()
+    pass  # Supabase-backed loaders are not cached; data refreshes on next rerun
 
 def _clear_config():
     _assets.clear(); _strategies.clear(); _scanner_assets.clear()
@@ -350,12 +351,13 @@ def _clear_config():
         from core.config import reload; reload()
     except Exception: pass
 
-@st.cache_data(ttl=30)
 def _pending_psych():
     try:
-        from p4_live.journal import get_all_trades as _gat, get_all_psychology as _gap
-        closed=[t for t in _gat() if t["status"] not in ("pending","filled","expired")]
-        already={p["trade_ref_id"] for p in _gap()}
+        from p4_live.journal_supabase import get_all_trades as _gat, get_all_psychology as _gap
+        client = st.session_state.get("supabase_client")
+        if not client: return 0
+        closed=[t for t in _gat(client) if t["status"] not in ("pending","filled","expired")]
+        already={p["trade_ref_id"] for p in _gap(client)}
         return sum(1 for t in closed
                    if f"{t['signal_date']}|{t['ticker']}|{t.get('strategy','')}" not in already)
     except Exception: return 0
@@ -401,30 +403,40 @@ def _load_analysis_cache(ticker, interval):
 
 # ── Account helpers ───────────────────────────────────────────────────────────
 def _acct():
+    try:
+        from p4_live.journal_supabase import get_user_settings as _gus
+        client = st.session_state.get("supabase_client")
+        us = _gus(client) if client else {}
+    except Exception:
+        us = {}
     return {
-        "balance":        float(os.getenv("ACCOUNT_BALANCE","7500")),
+        "balance":        float(us.get("account_balance") or os.getenv("ACCOUNT_BALANCE","7500")),
         "leverage":       int(os.getenv("ACCOUNT_LEVERAGE","100")),
-        "risk_pct":       float(os.getenv("RISK_PER_TRADE_PCT","0.5")),
-        # Lot-based trading constraints (Gold/commodity specific)
-        "lot_oz":         float(os.getenv("LOT_OZ","100")),          # oz per 1 standard lot
-        "min_lots":       float(os.getenv("MIN_LOTS","0.01")),        # broker minimum
-        "min_lot_margin": float(os.getenv("MIN_LOT_MARGIN","190")),   # $ margin for min_lots
+        "risk_pct":       float(us.get("risk_per_trade_pct") or os.getenv("RISK_PER_TRADE_PCT","0.5")),
+        "lot_oz":         float(os.getenv("LOT_OZ","100")),
+        "min_lots":       float(os.getenv("MIN_LOTS","0.01")),
+        "min_lot_margin": float(os.getenv("MIN_LOT_MARGIN","190")),
     }
 
 def _save_acct(bal, lev, risk, lot_oz=100, min_lots=0.01, min_lot_margin=190.0):
     e = str(ROOT/".env")
-    set_key(e,"ACCOUNT_BALANCE",str(bal))
     set_key(e,"ACCOUNT_LEVERAGE",str(lev))
-    set_key(e,"RISK_PER_TRADE_PCT",str(risk))
     set_key(e,"LOT_OZ",str(lot_oz))
     set_key(e,"MIN_LOTS",str(min_lots))
     set_key(e,"MIN_LOT_MARGIN",str(min_lot_margin))
     os.environ.update({
-        "ACCOUNT_BALANCE": str(bal), "ACCOUNT_LEVERAGE": str(lev),
-        "RISK_PER_TRADE_PCT": str(risk),
+        "ACCOUNT_LEVERAGE": str(lev),
         "LOT_OZ": str(lot_oz), "MIN_LOTS": str(min_lots),
         "MIN_LOT_MARGIN": str(min_lot_margin),
     })
+    try:
+        from p4_live.journal_supabase import save_user_settings as _sus
+        client = st.session_state.get("supabase_client")
+        if client:
+            _sus(client, {"account_balance": bal, "risk_per_trade_pct": risk})
+    except Exception:
+        set_key(e,"ACCOUNT_BALANCE",str(bal))
+        set_key(e,"RISK_PER_TRADE_PCT",str(risk))
 
 # ── YAML helpers ──────────────────────────────────────────────────────────────
 def _read_yaml(p):
@@ -460,6 +472,31 @@ def _trades_df(tl):
             "P&L":          f"{t['pnl_r']:+.2f}R" if t.get("pnl_r") is not None else "—",
         })
     return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+def _calc_close_pnl_r(trade: dict, outcome: str, exit_price: float) -> float:
+    """Compute pnl_r for a close operation, mirroring journal.py record_close logic."""
+    fill = trade.get("fill_price")
+    if fill is None:
+        return 0.0
+    direction = trade.get("direction", "long")
+    risk = abs(fill - (trade.get("stop_loss") or fill))
+    if risk < 1e-8:
+        return 0.0
+    if outcome == "loss":
+        return -1.0
+    if outcome == "breakeven":
+        return 0.0
+    alloc1 = (trade.get("tp1_alloc") or 70) / 100
+    alloc2 = (trade.get("tp2_alloc") or 30) / 100
+    tp2 = trade.get("tp2")
+    if outcome == "partial_win" and tp2 is not None:
+        tp1 = trade.get("tp1", exit_price)
+        if direction == "long":
+            return round((tp1 - fill) * alloc1 / risk + (exit_price - fill) * alloc2 / risk, 3)
+        return round((fill - tp1) * alloc1 / risk + (fill - exit_price) * alloc2 / risk, 3)
+    sign = 1 if direction == "long" else -1
+    return round(sign * (exit_price - fill) / risk, 3)
+
 
 def _calc_manual_r(e):
     """Calculate R for a manual entry. Returns (r_value, is_estimated).
@@ -621,16 +658,26 @@ def _run_scan_now(
     Optionally filtered by asset_ids (core config IDs) and/or timeframes.
     Returns (fired_count, recorded_count, errors).
     """
-    from core.config import get_watchlist
     from p4_live.scanner import scan_strategy
-    from p4_live.journal import record_signal
-
-    watchlist = get_watchlist()
+    from p4_live.journal_supabase import (
+        record_signal as _record_signal_sb,
+        get_user_watchlist as _guw_scan,
+    )
+    # Prefer per-user Supabase watchlist; fall back to shared YAML watchlist
+    try:
+        watchlist = _guw_scan(st.session_state["supabase_client"])
+        if not watchlist:
+            from core.config import get_watchlist
+            watchlist = get_watchlist()
+    except Exception:
+        from core.config import get_watchlist
+        watchlist = get_watchlist()
     if asset_ids:
         watchlist = [(a, s, tf) for a, s, tf in watchlist if a in asset_ids]
     if timeframes:
         watchlist = [(a, s, tf) for a, s, tf in watchlist if tf in timeframes]
 
+    _sb_client = st.session_state["supabase_client"]
     fired = 0; recorded = 0; errors: list[str] = []
     for asset_id, strategy_id, tf in watchlist:
         try:
@@ -642,7 +689,7 @@ def _run_scan_now(
             continue
         fired += 1
         try:
-            if record_signal(result):
+            if _record_signal_sb(_sb_client, result):
                 recorded += 1
         except Exception as e:
             errors.append(str(e))
@@ -782,8 +829,16 @@ def page_dashboard():
 
     # ── Scan controls — row 1: buttons + filters ─────────────────────────────
     try:
-        from core.config import get_watchlist as _gwl, get_all_assets as _gaa
-        _wl = _gwl()
+        from core.config import get_all_assets as _gaa
+        try:
+            from p4_live.journal_supabase import get_user_watchlist as _gwl_sb
+            _wl = _gwl_sb(st.session_state["supabase_client"])
+            if not _wl:
+                from core.config import get_watchlist as _gwl_yaml
+                _wl = _gwl_yaml()
+        except Exception:
+            from core.config import get_watchlist as _gwl_yaml
+            _wl = _gwl_yaml()
         _wl_asset_ids   = sorted({a for a, s, tf in _wl})
         _TF_ORDER = ["1m","5m","15m","30m","1h","4h","8h","1d","1wk"]
         _wl_tfs = sorted({tf for a, s, tf in _wl}, key=lambda x: _TF_ORDER.index(x) if x in _TF_ORDER else 99)
@@ -944,9 +999,18 @@ def page_dashboard():
     _active_combos: set[tuple[str, str, str]] | None = None
     if _active_only:
         try:
-            from core.config import get_watchlist as _gwl, get_ticker as _gtick
+            from core.config import get_ticker as _gtick
+            try:
+                from p4_live.journal_supabase import get_user_watchlist as _gwl_d
+                _wl_d = _gwl_d(st.session_state["supabase_client"])
+                if not _wl_d:
+                    from core.config import get_watchlist as _gwl_yaml_d
+                    _wl_d = _gwl_yaml_d()
+            except Exception:
+                from core.config import get_watchlist as _gwl_yaml_d
+                _wl_d = _gwl_yaml_d()
             _active_combos = set()
-            for _aid, _sid, _tf in _gwl():
+            for _aid, _sid, _tf in _wl_d:
                 try:
                     _active_combos.add((_gtick(_aid, source="yfinance"), _sid, _tf))
                 except Exception:
@@ -1697,6 +1761,10 @@ def page_analysis():
                            disabled=not pb_tickers_raw)
 
         if pb_btn and pb_tickers_raw:
+            from core.demo_limit import try_consume as _dl_try, DEMO_LIMIT_MESSAGE as _dl_msg
+            if not _dl_try(1):
+                st.error(_dl_msg)
+                st.stop()
             _pb_tickers = [t.strip().upper() for t in pb_tickers_raw.replace("\n",",").split(",") if t.strip()]
             _pb_days = {"1 day":2,"1 week":8,"1 month":35,"3 months":95}[pb_period]
 
@@ -1813,6 +1881,10 @@ def page_analysis():
                 except Exception: pass
 
         if run_clicked:
+            from core.demo_limit import try_consume as _dl_try, DEMO_LIMIT_MESSAGE as _dl_msg
+            if not _dl_try(1):
+                st.error(_dl_msg)
+                st.stop()
             with st.spinner(f"Analyzing {aname} ({ticker}) on {tf}..."):
                 try:
                     from p1_analysis_engine.engine import analyze_full
@@ -2545,10 +2617,13 @@ def entry_logic(df, tech):
                 _ai_btn = st.button("Generate code", type="primary", use_container_width=True, key="ai_gen_btn")
 
             if _ai_btn:
+                from core.demo_limit import try_consume as _dl_try, DEMO_LIMIT_MESSAGE as _dl_msg
                 if not _ai_desc.strip():
                     st.error("Please describe your strategy first.")
                 elif not os.getenv("ANTHROPIC_API_KEY"):
                     st.error("No ANTHROPIC_API_KEY. Go to Settings → API Keys.")
+                elif not _dl_try(1):
+                    st.error(_dl_msg)
                 else:
                     _direction_hint = {
                         "Long only": "Generate LONG signals only — no short trades.",
@@ -2820,8 +2895,7 @@ def entry_logic(df, tech):
 
         # ── Iterate actual viable combos from assets.yaml ────────────────────
         from core.config import get_all_assets as _gaa_cmp  # noqa: PLC0415
-        from p4_live.journal import get_all_trades as _gat_cmp  # noqa: PLC0415
-        _all_live = _gat_cmp()
+        _all_live = _trades()
         _closed_live = [t for t in _all_live
                         if t["status"] not in ("pending","filled","expired")]
 
@@ -2997,9 +3071,12 @@ def entry_logic(df, tech):
 # =============================================================================
 def page_journal():
     st.title("Trade Journal")
-    from p4_live.journal import (update_manual_entry, delete_manual_entry,
-                                  save_manual_entry, save_psychology, add_note,
-                                  record_fill, record_close, record_expired)
+    from p4_live.journal_supabase import (
+        update_manual_entry, delete_manual_entry, save_manual_entry,
+        save_psychology, add_note,
+        record_fill_direct as _rf, record_close_direct as _rc, record_expired_direct as _re,
+    )
+    _jclient = st.session_state["supabase_client"]
     all_t=_trades(); assets=_assets(); strategies=_strategies()
 
     t_sim,t_rt,t_mgr,t_ss,t_psy,t_met=st.tabs(
@@ -3231,7 +3308,7 @@ def page_journal():
                                                      else (_ex_v-_e)/_risk, 3)
                                     final_r=u_pnl if u_pnl!=0 else auto_r
                                     final_d=u_dollars if u_dollars!=0 else None
-                                    update_manual_entry(e["id"],direction=u_dir,
+                                    update_manual_entry(_jclient, e["id"],direction=u_dir,
                                                         exit_price=_ex_v,original_sl=_orig,
                                                         stop_loss=_sl_v,pnl_r=final_r,
                                                         pnl_dollars=final_d)
@@ -3248,7 +3325,7 @@ def page_journal():
                                 st.warning("This cannot be undone. Are you sure?")
                                 dc1,dc2=st.columns(2)
                                 if dc1.button("Yes, delete",key=f"dely_{e['id']}",type="primary"):
-                                    delete_manual_entry(e["id"])
+                                    delete_manual_entry(_jclient, e["id"])
                                     st.session_state.pop(f"confirm_del_{e['id']}",None)
                                     _clear(); st.rerun()
                                 if dc2.button("Cancel",key=f"deln_{e['id']}"):
@@ -3286,8 +3363,9 @@ def page_journal():
                         fp=fa.number_input("Fill price",min_value=0.01,step=0.01,format="%.2f")
                         fd=fb.date_input("Fill date",value=date.today())
                         if st.form_submit_button("Record Fill",type="primary"):
-                            record_fill(sel["signal_date"],float(fp),fd.isoformat(),
-                                       ticker=sel["ticker"],strategy=sel.get("strategy"))
+                            _rf(_jclient, sel["signal_date"], sel["ticker"],
+                                sel.get("strategy","mtf_trend"), sel.get("timeframe","1d"),
+                                float(fp), fd.isoformat())
                             _clear(); st.success("Fill recorded."); st.rerun()
                 else: st.info(f"Only PENDING trades can be filled. Status: {sel['status'].upper()}")
             with tt2:
@@ -3298,15 +3376,18 @@ def page_journal():
                         ep=cb.number_input("Exit price",min_value=0.01,step=0.01,format="%.2f")
                         ed=cc.date_input("Exit date",value=date.today())
                         if st.form_submit_button("Record Close",type="primary"):
-                            record_close(sel["signal_date"],out,float(ep),ed.isoformat(),
-                                        ticker=sel["ticker"],strategy=sel.get("strategy"))
+                            _pnl = _calc_close_pnl_r(sel, out, float(ep))
+                            _rc(_jclient, sel["signal_date"], sel["ticker"],
+                                sel.get("strategy","mtf_trend"), sel.get("timeframe","1d"),
+                                out, float(ep), ed.isoformat(), _pnl)
                             _clear(); st.success(f"Closed as {out}."); st.rerun()
                 else: st.info(f"Trade must be FILLED. Status: {sel['status'].upper()}")
             with tt3:
                 if sel["status"]=="pending":
                     st.warning(f"Mark {sel['signal_date']} {_label(sel)} as expired?")
                     if st.button("Expire",type="primary"):
-                        record_expired(sel["signal_date"],ticker=sel["ticker"],strategy=sel.get("strategy"))
+                        _re(_jclient, sel["signal_date"], sel["ticker"],
+                            sel.get("strategy","mtf_trend"), sel.get("timeframe","1d"))
                         _clear(); st.success("Expired."); st.rerun()
                 else: st.info(f"Only PENDING signals can be expired. Status: {sel['status'].upper()}")
             with tt4:
@@ -3314,8 +3395,8 @@ def page_journal():
                     nt=st.text_area("Note",value=sel.get("notes",""),height=80)
                     if st.form_submit_button("Save Note"):
                         if nt.strip():
-                            add_note(sel["signal_date"],nt.strip(),
-                                    ticker=sel["ticker"],strategy=sel.get("strategy"))
+                            add_note(_jclient, sel["signal_date"], sel["ticker"],
+                                    sel.get("strategy","mtf_trend"), sel.get("timeframe","1d"), nt.strip())
                             _clear(); st.success("Saved."); st.rerun()
 
     # ── Add Trade (screenshot or manual) ──────────────────────────────────────
@@ -3363,31 +3444,41 @@ def page_journal():
 
             # ── AI analysis buttons ───────────────────────────────────────────
             ab1,ab2,ab3=st.columns(3)
+            from core.demo_limit import try_consume as _dl_try, DEMO_LIMIT_MESSAGE as _dl_msg
             if ab1.button("Analyze broker screenshot",type="primary",disabled=not uploaded,
                           use_container_width=True):
-                with st.spinner("AI reading broker data…"):
-                    mt=f"image/{uploaded.type.split('/')[-1]}".replace("image/jpg","image/jpeg")
-                    analysis=_analyze_screenshot(uploaded.getvalue(),mt,j_notes,screenshot_type="broker")
-                st.session_state["ss_analysis"]=analysis
-                st.session_state.pop("ss_chart_analysis",None)
-                st.success("Broker data extracted — review below.")
+                if not _dl_try(1):
+                    st.error(_dl_msg)
+                else:
+                    with st.spinner("AI reading broker data…"):
+                        mt=f"image/{uploaded.type.split('/')[-1]}".replace("image/jpg","image/jpeg")
+                        analysis=_analyze_screenshot(uploaded.getvalue(),mt,j_notes,screenshot_type="broker")
+                    st.session_state["ss_analysis"]=analysis
+                    st.session_state.pop("ss_chart_analysis",None)
+                    st.success("Broker data extracted — review below.")
             if ab2.button("Analyze chart screenshot",type="primary",disabled=not uploaded_chart,
                           use_container_width=True):
-                with st.spinner("AI reading chart…"):
-                    mt2=f"image/{uploaded_chart.type.split('/')[-1]}".replace("image/jpg","image/jpeg")
-                    chart_an=_analyze_screenshot(uploaded_chart.getvalue(),mt2,j_notes,screenshot_type="chart")
-                st.session_state["ss_chart_analysis"]=chart_an
-                st.success("Chart analyzed — review below.")
+                if not _dl_try(1):
+                    st.error(_dl_msg)
+                else:
+                    with st.spinner("AI reading chart…"):
+                        mt2=f"image/{uploaded_chart.type.split('/')[-1]}".replace("image/jpg","image/jpeg")
+                        chart_an=_analyze_screenshot(uploaded_chart.getvalue(),mt2,j_notes,screenshot_type="chart")
+                    st.session_state["ss_chart_analysis"]=chart_an
+                    st.success("Chart analyzed — review below.")
             if ab3.button("Analyze both",type="primary",
                           disabled=not (uploaded and uploaded_chart),use_container_width=True):
-                with st.spinner("AI analyzing both screenshots…"):
-                    mt=f"image/{uploaded.type.split('/')[-1]}".replace("image/jpg","image/jpeg")
-                    mt2=f"image/{uploaded_chart.type.split('/')[-1]}".replace("image/jpg","image/jpeg")
-                    analysis=_analyze_screenshot(uploaded.getvalue(),mt,j_notes,screenshot_type="broker")
-                    chart_an=_analyze_screenshot(uploaded_chart.getvalue(),mt2,j_notes,screenshot_type="chart")
-                st.session_state["ss_analysis"]=analysis
-                st.session_state["ss_chart_analysis"]=chart_an
-                st.success("Both analyzed — review below.")
+                if not _dl_try(2):
+                    st.error(_dl_msg)
+                else:
+                    with st.spinner("AI analyzing both screenshots…"):
+                        mt=f"image/{uploaded.type.split('/')[-1]}".replace("image/jpg","image/jpeg")
+                        mt2=f"image/{uploaded_chart.type.split('/')[-1]}".replace("image/jpg","image/jpeg")
+                        analysis=_analyze_screenshot(uploaded.getvalue(),mt,j_notes,screenshot_type="broker")
+                        chart_an=_analyze_screenshot(uploaded_chart.getvalue(),mt2,j_notes,screenshot_type="chart")
+                    st.session_state["ss_analysis"]=analysis
+                    st.session_state["ss_chart_analysis"]=chart_an
+                    st.success("Both analyzed — review below.")
 
             # ── AI results ────────────────────────────────────────────────────
             an=st.session_state.get("ss_analysis",{})
@@ -3457,7 +3548,7 @@ def page_journal():
                                    else (float(_entry)-float(_exit))/_risk, 3)
                     combined_ai=json.dumps({"broker":an,"chart":chart_an,"merged":merged},default=str)
                     _pnl_dollars=an.get("pnl_dollars") or merged.get("pnl_dollars")
-                    eid=save_manual_entry({
+                    eid=save_manual_entry(_jclient, {
                         "entry_date":j_date.isoformat(),
                         "asset":j_asset or merged.get("asset",""),
                         "direction":j_dir if j_dir!="unknown" else merged.get("direction","unknown"),
@@ -3471,7 +3562,7 @@ def page_journal():
                         "chart_screenshot_path":str(chart_p) if chart_p else None,
                         "tags":j_tags})
                     if j_pre and j_pre!="—":
-                        save_psychology({"trade_ref_type":"manual","trade_ref_id":str(eid),
+                        save_psychology(_jclient, {"trade_ref_type":"manual","trade_ref_id":str(eid),
                                         "pre_state":j_pre,"lesson":merged.get("lessons","")})
                     st.session_state.pop("ss_analysis",None)
                     st.session_state.pop("ss_chart_analysis",None)
@@ -3624,7 +3715,7 @@ def page_journal():
                                 key=(d or "",asset_v,str(round(entry_v or 0,4)))
                                 if skip_dup and key in existing_keys:
                                     skipped+=1; continue
-                                save_manual_entry({
+                                save_manual_entry(_jclient, {
                                     "entry_date": d or date.today().isoformat(),
                                     "asset":      asset_v,
                                     "direction":  _parse_dir(_get(row,m_dir),dir_map_parsed),
@@ -3684,7 +3775,7 @@ def page_journal():
                     mistakes=st.multiselect("Mistakes made",MISTAKES,key="p_mistakes")
                     lesson=st.text_input("One-sentence lesson",key="p_lesson")
                     if st.form_submit_button("Save Psychology Entry",type="primary"):
-                        save_psychology({"trade_ref_type":"live","trade_ref_id":ref_id,
+                        save_psychology(_jclient, {"trade_ref_type":"live","trade_ref_id":ref_id,
                             "pre_state":pre_s,"pre_confidence":pre_c,"pre_notes":pre_n,
                             "post_state":post_s,"post_notes":post_n,"execution_quality":eq,
                             "mistakes":mistakes,"lesson":lesson})
@@ -3791,11 +3882,11 @@ def page_journal():
         with bc1:
             st.markdown("**Best 5 trades:**")
             best=sorted([t for t in closed if t.get("pnl_r")],key=lambda x:x["pnl_r"],reverse=True)[:5]
-            if best: st.dataframe(_trades_df(best)[["Date","Asset","Strategy","P&L"]],use_container_width=True,hide_index=True)
+            if best: st.dataframe(_trades_df(best)[["Signal (RO)","Asset","Strategy","P&L"]],use_container_width=True,hide_index=True)
         with bc2:
             st.markdown("**Worst 5 trades:**")
             worst=sorted([t for t in closed if t.get("pnl_r")],key=lambda x:x["pnl_r"])[:5]
-            if worst: st.dataframe(_trades_df(worst)[["Date","Asset","Strategy","P&L"]],use_container_width=True,hide_index=True)
+            if worst: st.dataframe(_trades_df(worst)[["Signal (RO)","Asset","Strategy","P&L"]],use_container_width=True,hide_index=True)
 
         # Execution analysis
         st.markdown("---")
@@ -3942,18 +4033,32 @@ def page_settings():
     with t2:
         st.subheader("Risk Rules & Limits")
         env=ROOT/".env"
+        try:
+            from p4_live.journal_supabase import get_user_settings as _gus
+            _rr_us = _gus(st.session_state["supabase_client"])
+        except Exception:
+            _rr_us = {}
         with st.form("risk_rules"):
             rr1,rr2=st.columns(2)
             max_trades=rr1.number_input("Max simultaneous open trades",
-                                         value=int(os.getenv("MAX_OPEN_TRADES","5")),min_value=1)
+                                         value=int(_rr_us.get("max_open_trades") or os.getenv("MAX_OPEN_TRADES","5")),min_value=1)
             daily_loss=rr2.number_input("Daily loss limit (R) — 0 = disabled",
-                                          value=float(os.getenv("DAILY_LOSS_LIMIT_R","0")),min_value=0.0,step=0.5)
+                                          value=float(_rr_us.get("daily_loss_limit_r") or os.getenv("DAILY_LOSS_LIMIT_R","0")),min_value=0.0,step=0.5)
             rr3,rr4=st.columns(2)
             weekly_dd=rr3.number_input("Weekly drawdown limit (R) — 0 = disabled",
-                                         value=float(os.getenv("WEEKLY_DD_LIMIT_R","0")),min_value=0.0,step=0.5)
+                                         value=float(_rr_us.get("weekly_dd_limit_r") or os.getenv("WEEKLY_DD_LIMIT_R","0")),min_value=0.0,step=0.5)
             max_pos_risk=rr4.number_input("Max single position risk (%)",
                                             value=float(os.getenv("MAX_POSITION_RISK_PCT","2.0")),min_value=0.1,step=0.1)
             if st.form_submit_button("Save Risk Rules",type="primary"):
+                try:
+                    from p4_live.journal_supabase import save_user_settings as _sus
+                    _sus(st.session_state["supabase_client"], {
+                        "max_open_trades": max_trades,
+                        "daily_loss_limit_r": daily_loss,
+                        "weekly_dd_limit_r": weekly_dd,
+                    })
+                except Exception:
+                    pass
                 set_key(str(env),"MAX_OPEN_TRADES",str(max_trades))
                 set_key(str(env),"DAILY_LOSS_LIMIT_R",str(daily_loss))
                 set_key(str(env),"WEEKLY_DD_LIMIT_R",str(weekly_dd))
@@ -3980,13 +4085,22 @@ def page_settings():
         else: st.warning("No alert channels configured.")
         with st.form("tg_form"):
             st.markdown("**Telegram**")
+            try:
+                from p4_live.journal_supabase import get_user_settings as _gus
+                _tg_us = _gus(st.session_state["supabase_client"])
+            except Exception:
+                _tg_us = {}
             tg1,tg2=st.columns(2)
-            tg_tok=tg1.text_input("Bot Token",value=os.getenv("TELEGRAM_BOT_TOKEN",""),type="password")
-            tg_cid=tg2.text_input("Chat ID",value=os.getenv("TELEGRAM_CHAT_ID",""))
+            tg_tok=tg1.text_input("Bot Token",value=_tg_us.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN",""),type="password")
+            tg_cid=tg2.text_input("Chat ID",value=_tg_us.get("telegram_chat_id") or os.getenv("TELEGRAM_CHAT_ID",""))
             if st.form_submit_button("Save Telegram"):
-                e=str(ROOT/".env"); set_key(e,"TELEGRAM_BOT_TOKEN",tg_tok); set_key(e,"TELEGRAM_CHAT_ID",tg_cid)
+                try:
+                    from p4_live.journal_supabase import save_user_settings as _sus
+                    _sus(st.session_state["supabase_client"], {"telegram_bot_token": tg_tok, "telegram_chat_id": tg_cid})
+                except Exception:
+                    pass
                 os.environ["TELEGRAM_BOT_TOKEN"]=tg_tok; os.environ["TELEGRAM_CHAT_ID"]=tg_cid
-                st.success("Saved. Restart scheduler to apply.")
+                st.success("Saved.")
         with st.form("em_form"):
             st.markdown("**Email (SMTP)**")
             em1,em2=st.columns(2)
@@ -4016,8 +4130,70 @@ def page_settings():
 
         CAT_ICON = {"index":"📈","crypto":"₿","commodity":"🥇","forex":"💱","stock":"🏢"}
 
+        # ── My Watchlist (per-user, Supabase-backed) ──────────────────────────
+        st.markdown("#### My Watchlist")
+        st.caption(
+            "Choose which markets and strategies the scanner runs for your account. "
+            "Each user has their own selection — changes here don't affect other users."
+        )
+        try:
+            from p4_live.journal_supabase import (
+                get_user_watchlist as _guwl,
+                replace_user_watchlist as _ruwl,
+            )
+            _wl_client = st.session_state["supabase_client"]
+            _cur_wl = set(_guwl(_wl_client))
+        except Exception:
+            _cur_wl = set()
+            _wl_client = None
+
+        _all_combos: list[tuple[str, str, str, str]] = []  # (asset_id, label, strat_id, tf)
+        for _wa in [a for a in assets if a.get("enabled", True)]:
+            _waid = _wa["id"]
+            for _wentry in _wa.get("strategies", []):
+                if isinstance(_wentry, str):
+                    _wsid = _wentry
+                    _wtfs = [_strategies().get(_wsid, {}).get("default_timeframe", "1d")]
+                else:
+                    _wsid = _wentry.get("id", "")
+                    _wtfs = _wentry.get("timeframes", ["1d"])
+                for _wtf in _wtfs:
+                    _all_combos.append((_waid, _wa.get("label", _waid), _wsid, _wtf))
+
+        if _all_combos:
+            _wl_cols = st.columns(3)
+            for _ci, (_waid, _walabel, _wsid, _wtf) in enumerate(_all_combos):
+                _wkey = f"wl_{_waid}_{_wsid}_{_wtf}"
+                _wdefault = (_waid, _wsid, _wtf) in _cur_wl
+                _icon = CAT_ICON.get(
+                    next((a.get("category","") for a in assets if a["id"]==_waid), ""), "📊"
+                )
+                _wl_cols[_ci % 3].checkbox(
+                    f"{_icon} {_walabel} · {_wsid} / {_wtf}",
+                    value=_wdefault,
+                    key=_wkey,
+                )
+
+            if st.button("Save My Watchlist", type="primary"):
+                if _wl_client:
+                    _new_entries = [
+                        {"asset_id": waid, "strategy_id": wsid, "timeframe": wtf,
+                         "params": {}, "enabled": True}
+                        for waid, _, wsid, wtf in _all_combos
+                        if st.session_state.get(f"wl_{waid}_{wsid}_{wtf}", False)
+                    ]
+                    _ruwl(_wl_client, _new_entries)
+                    st.success(f"Watchlist saved — {len(_new_entries)} active combination(s).")
+                    st.rerun()
+                else:
+                    st.error("Supabase not connected.")
+        else:
+            st.info("No enabled assets in the global catalog yet. Add one below.")
+
+        st.markdown("---")
+
         # ── Asset cards grid ──────────────────────────────────────────────────
-        st.markdown("#### Markets")
+        st.markdown("#### Global Catalog")
         n_cols = 3
         card_cols = st.columns(n_cols)
         for idx, a in enumerate(assets):
@@ -4202,23 +4378,20 @@ def page_settings():
 
     # ── System ─────────────────────────────────────────────────────────────────
     with t7:
-        # DB stats
-        from p4_live.journal import JOURNAL_DB, _conn as _jconn
-        if JOURNAL_DB.exists():
-            c=_jconn()
-            n_trades=c.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-            n_manual=c.execute("SELECT COUNT(*) FROM manual_entries").fetchone()[0]
-            n_psych=c.execute("SELECT COUNT(*) FROM psychology").fetchone()[0]
-            c.close()
-            db_sz=JOURNAL_DB.stat().st_size/1024
-            ds1,ds2,ds3,ds4=st.columns(4)
-            ds1.metric("Trades",n_trades); ds2.metric("Manual Entries",n_manual)
-            ds3.metric("Psychology Entries",n_psych); ds4.metric("DB Size",f"{db_sz:.1f} KB")
+        # DB stats (Supabase)
+        try:
+            all_t2=_trades(); man=_manual_entries(); psych_s=_psychology_all()
+            ds1,ds2,ds3=st.columns(3)
+            ds1.metric("Trades",len(all_t2))
+            ds2.metric("Manual Entries",len(man))
+            ds3.metric("Psychology Entries",len(psych_s))
+        except Exception:
+            st.caption("DB stats unavailable")
 
         # Export
         st.markdown("---")
         st.subheader("Export & Backup")
-        ec1,ec2,ec3=st.columns(3)
+        ec1,ec2=st.columns(2)
         with ec1:
             all_t2=_trades()
             if all_t2:
@@ -4229,12 +4402,6 @@ def page_settings():
             if man:
                 mdf=pd.DataFrame([{k:v for k,v in e.items() if k!="ai_analysis"} for e in man])
                 st.download_button("Export Journal CSV",mdf.to_csv(index=False),"journal_entries.csv","text/csv",use_container_width=True)
-        with ec3:
-            if st.button("Backup Database",use_container_width=True):
-                bk_dir=ROOT/"outputs"/"backups"; bk_dir.mkdir(parents=True,exist_ok=True)
-                bk_path=bk_dir/f"live_trades_{date.today().isoformat()}.db"
-                import shutil; shutil.copy2(str(JOURNAL_DB),str(bk_path))
-                st.success(f"Backed up to {bk_path.name}")
 
         st.markdown("---")
         st.subheader("Scheduler Log")
@@ -4856,30 +5023,696 @@ def page_activate(reason: str = "") -> None:
 
 
 # =============================================================================
-# LICENSE GATE — checked once per session before any UI renders
+# INSIDER ACTIVITY PAGE
 # =============================================================================
-from core import license as _lic_module  # noqa: E402
 
-_lic_valid, _lic_status = _lic_module.check()
-if not _lic_valid:
-    page_activate(_lic_status)
-    st.stop()
+def page_insider():  # noqa: C901
+    # ── Header + refresh strip ────────────────────────────────────────────────
+    _hdr_l, _hdr_r = st.columns([4, 1])
+    _hdr_l.markdown(
+        '<h2 style="color:#E2E8F0;font-size:1.35rem;font-weight:700;margin-bottom:.1rem">'
+        'Insider Activity</h2>'
+        '<div style="color:#475569;font-size:.78rem;margin-bottom:.6rem">'
+        'Congressional STOCK Act disclosures · SEC Form 4 corporate insiders · portfolio correlation'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    if _hdr_r.button("⟳ Refresh", use_container_width=True, key="ins_hdr_refresh"):
+        with st.spinner("Fetching insider data…"):
+            try:
+                from p5_insider.scrapers.congress import refresh as _cr
+                from p5_insider.scrapers.sec_form4 import refresh as _f4r
+                from p5_insider.alerts import send_new_alerts as _san
+                _rc = _cr()
+                _rf = _f4r()
+                _ra = _san(since_days=7)
+                st.success(
+                    f"House +{_rc['house']} · Senate +{_rc['senate']} · "
+                    f"Form 4 +{_rf} · alerts sent: {_ra}"
+                )
+            except Exception as _re:
+                st.error(f"Refresh failed: {_re}")
 
-# Offline-grace warning (shown as a sidebar banner, not a blocker)
-_lic_offline_days: int | None = None
-if _lic_valid and _lic_status.startswith("offline:"):
     try:
-        _lic_offline_days = int(_lic_status.split(":")[1])
-    except (IndexError, ValueError):
-        _lic_offline_days = 0
+        import importlib, p5_insider.db as _p5db, p5_insider.correlator as _p5cor, p5_insider.analytics as _p5an
+        importlib.reload(_p5db)
+        importlib.reload(_p5cor)
+        importlib.reload(_p5an)
+        from p5_insider.db import (
+            get_portfolio, add_portfolio_item, remove_portfolio_item,
+            get_congress_trades, get_form4_trades,
+        )
+        get_alert_history = _p5db.get_alert_history
+        from p5_insider.correlator import get_scored_trades, get_portfolio_summary
+        from p5_insider.analytics import (
+            get_cluster_trades, get_politician_stats,
+            get_top_congress_tickers, get_price_impact, get_activity_timeline,
+        )
+    except ImportError as e:
+        st.error(f"p5_insider module not found: {e}")
+        return
+
+    (
+        _ins_tab_port,
+        _ins_tab_summary,
+        _ins_tab_trades,
+        _ins_tab_scored,
+        _ins_tab_analytics,
+        _ins_tab_alerts,
+    ) = st.tabs([
+        "Portfolio",
+        "Signal Summary",
+        "Trade Explorer",
+        "Scored Trades",
+        "Analytics",
+        "Alert History",
+    ])
+
+    # =========================================================================
+    # TAB 1 — Portfolio management
+    # =========================================================================
+    with _ins_tab_port:
+        st.markdown("#### Watched Tickers")
+        st.caption(
+            "Tickers here are monitored for congressional disclosures and SEC Form 4 filings. "
+            "Direction (long/short) drives the conflict/confirmation scoring."
+        )
+
+        portfolio = get_portfolio()
+
+        with st.form("ins_add_ticker", clear_on_submit=True):
+            _c1, _c2, _c3, _c4 = st.columns([2, 3, 1.2, 1])
+            _new_tick  = _c1.text_input("Ticker", placeholder="AAPL")
+            _new_label = _c2.text_input("Label (optional)", placeholder="Apple Inc.")
+            _new_dir   = _c3.selectbox("Direction", ["long", "short"])
+            if _c4.form_submit_button("Add", use_container_width=True) and _new_tick.strip():
+                add_portfolio_item(_new_tick.strip(), _new_label.strip(), _new_dir)
+                st.rerun()
+
+        if not portfolio:
+            st.info("No tickers watched yet. Add one above to start tracking insider trades.")
+        else:
+            st.markdown(
+                '<div style="display:grid;grid-template-columns:1fr 2.5fr 1fr .6fr;'
+                'gap:.3rem;padding:.3rem .5rem;font-size:.72rem;color:#283848;'
+                'font-weight:600;text-transform:uppercase;letter-spacing:.06em">'
+                '<span>Ticker</span><span>Label</span><span>Direction</span><span></span></div>',
+                unsafe_allow_html=True,
+            )
+            for _p in portfolio:
+                _col_t, _col_l, _col_d, _col_rm = st.columns([1, 2.5, 1, .6])
+                _col_t.markdown(
+                    f'<span style="color:#E2E8F0;font-weight:700;font-size:.9rem">{_p["ticker"]}</span>',
+                    unsafe_allow_html=True,
+                )
+                _col_l.markdown(
+                    f'<span style="color:#64748B;font-size:.83rem">{_p.get("label","")}</span>',
+                    unsafe_allow_html=True,
+                )
+                _dir_color = "#10B981" if _p["direction"] == "long" else "#EF4444"
+                _col_d.markdown(
+                    f'<span style="color:{_dir_color};font-size:.83rem;font-weight:600">'
+                    f'{_p["direction"].upper()}</span>',
+                    unsafe_allow_html=True,
+                )
+                if _col_rm.button("✕", key=f"ins_rm_{_p['ticker']}", help=f"Remove {_p['ticker']}"):
+                    remove_portfolio_item(_p["ticker"])
+                    st.rerun()
+
+    # =========================================================================
+    # TAB 2 — Signal Summary (per-ticker cards + activity timeline)
+    # =========================================================================
+    with _ins_tab_summary:
+        _sum_c1, _sum_c2 = st.columns([2, 2])
+        _sum_days = _sum_c1.selectbox(
+            "Look-back window", [7, 14, 30, 60, 90], index=2, key="ins_sum_days",
+            format_func=lambda x: f"Last {x} days",
+        )
+        _sum_ticker_filter = _sum_c2.text_input(
+            "Activity chart — ticker", placeholder="e.g. AAPL", key="ins_sum_ticker"
+        ).strip().upper()
+
+        summary = get_portfolio_summary(since_days=_sum_days)
+
+        if not summary:
+            st.info("No portfolio tickers or no insider activity found for this window.")
+        else:
+            _SIGNAL_STYLES = {
+                "conflict": ("#FCA5A5", "#1C0000", "⚠️ CONFLICT"),
+                "bearish":  ("#FCA5A5", "#180000", "↓ Bearish"),
+                "bullish":  ("#6EE7B7", "#001A0E", "↑ Bullish"),
+                "mixed":    ("#FCD34D", "#1A1200", "~ Mixed"),
+                "neutral":  ("#475569", "#0A1220", "— Neutral"),
+            }
+            _ncols = min(len(summary), 3)
+            _cols  = st.columns(_ncols)
+            for _i, _s in enumerate(summary):
+                _col = _cols[_i % _ncols]
+                _sig = _s.get("signal", "neutral")
+                _sig_color, _sig_bg, _sig_label = _SIGNAL_STYLES.get(_sig, _SIGNAL_STYLES["neutral"])
+                _dir_icon = "↑" if _s["direction"] == "long" else "↓"
+                _col.markdown(
+                    f'<div style="background:{_sig_bg};border:1px solid {_sig_color}33;'
+                    f'border-radius:8px;padding:.75rem .9rem;margin:.3rem 0">'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                    f'<span style="color:#E2E8F0;font-weight:700;font-size:1rem">{_s["ticker"]}</span>'
+                    f'<span style="color:{_sig_color};font-size:.72rem;font-weight:600;'
+                    f'background:{_sig_color}22;padding:.1rem .4rem;border-radius:4px">{_sig_label}</span></div>'
+                    f'<div style="color:#475569;font-size:.73rem;margin:.18rem 0">'
+                    f'{_s.get("label",_s["ticker"])} &nbsp;·&nbsp; {_dir_icon} {_s["direction"].upper()}</div>'
+                    f'<div style="display:flex;gap:.9rem;margin-top:.4rem;align-items:center">'
+                    f'<span style="font-size:.73rem;color:#10B981;font-weight:600">▲ {_s["buys"]}</span>'
+                    f'<span style="font-size:.73rem;color:#EF4444;font-weight:600">▼ {_s["sells"]}</span>'
+                    f'<span style="font-size:.73rem;color:#94A3B8">Score&nbsp;'
+                    f'<b style="color:#E2E8F0">{_s["max_score"]:.0f}</b>/10</span></div>'
+                    f'<div style="font-size:.68rem;color:#1E3040;margin-top:.25rem">'
+                    f'Latest disclosure: {_s.get("latest") or "—"}</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+        # Activity timeline chart for a selected ticker
+        if _sum_ticker_filter:
+            _tl = get_activity_timeline(_sum_ticker_filter, since_days=180)
+            if _tl:
+                import plotly.graph_objects as _go_ins
+                _buy_dates  = [r["date"] for r in _tl if r["action"] == "buy"]
+                _sell_dates = [r["date"] for r in _tl if r["action"] == "sell"]
+                _buy_who    = [r.get("who","") for r in _tl if r["action"] == "buy"]
+                _sell_who   = [r.get("who","") for r in _tl if r["action"] == "sell"]
+                _fig_tl = _go_ins.Figure()
+                _fig_tl.add_trace(_go_ins.Scatter(
+                    x=_buy_dates, y=[1]*len(_buy_dates),
+                    mode="markers", marker=dict(color="#10B981", size=10, symbol="triangle-up"),
+                    name="Buy", text=_buy_who, hovertemplate="%{text}<br>%{x}<extra></extra>",
+                ))
+                _fig_tl.add_trace(_go_ins.Scatter(
+                    x=_sell_dates, y=[-1]*len(_sell_dates),
+                    mode="markers", marker=dict(color="#EF4444", size=10, symbol="triangle-down"),
+                    name="Sell", text=_sell_who, hovertemplate="%{text}<br>%{x}<extra></extra>",
+                ))
+                _fig_tl.update_layout(
+                    title=f"{_sum_ticker_filter} — insider activity (180d)",
+                    paper_bgcolor="#060B14", plot_bgcolor="#060B14",
+                    font_color="#94A3B8",
+                    height=200,
+                    margin=dict(l=20, r=20, t=40, b=20),
+                    yaxis=dict(visible=False, range=[-2, 2]),
+                    xaxis=dict(gridcolor="#0C1524"),
+                    showlegend=True,
+                    legend=dict(bgcolor="#0A1220", bordercolor="#0C1524"),
+                )
+                st.plotly_chart(_fig_tl, use_container_width=True)
+            else:
+                st.info(f"No activity data for {_sum_ticker_filter} in last 180 days.")
+
+    # =========================================================================
+    # TAB 3 — Trade Explorer
+    # =========================================================================
+    with _ins_tab_trades:
+        _rt_r1c1, _rt_r1c2, _rt_r1c3, _rt_r1c4 = st.columns([1.5, 1.5, 1.5, 1])
+        _rt_src       = _rt_r1c1.selectbox("Source", ["All", "House", "Senate", "Form 4"], key="ins_rt_src")
+        _rt_days      = _rt_r1c2.selectbox(
+            "Period", [7, 14, 30, 60, 90, 180], index=2, key="ins_rt_days",
+            format_func=lambda x: f"Last {x} days",
+        )
+        _rt_ticker    = _rt_r1c3.text_input("Filter ticker", placeholder="SPY (blank = all)", key="ins_rt_ticker").strip().upper()
+        _rt_port_only = _rt_r1c4.toggle("Portfolio only", value=True, key="ins_rt_port_only")
+
+        _since_iso    = (date.today() - timedelta(days=_rt_days)).isoformat()
+        _port_tickers = {p["ticker"] for p in get_portfolio()} if _rt_port_only else None
+
+        _rt_rows: list[dict] = []
+        if _rt_src in ("All", "House", "Senate"):
+            for _t in get_congress_trades(since_date=_since_iso, limit=2000):
+                if _port_tickers is not None and _t.get("ticker") not in _port_tickers:
+                    continue
+                if _rt_ticker and _t.get("ticker") != _rt_ticker:
+                    continue
+                _src_name = (_t.get("source") or "").capitalize()
+                if _rt_src == "House"  and _src_name != "House":
+                    continue
+                if _rt_src == "Senate" and _src_name != "Senate":
+                    continue
+                _rt_rows.append({
+                    "Source":    _src_name,
+                    "Date":      _t.get("disclosure_date",""),
+                    "Ticker":    _t.get("ticker",""),
+                    "Person":    _t.get("politician",""),
+                    "Party":     _t.get("party",""),
+                    "Action":    (_t.get("transaction_type") or "").upper(),
+                    "Amount":    _t.get("amount_str",""),
+                    "Asset":     (_t.get("asset_description") or "")[:45],
+                })
+        if _rt_src in ("All", "Form 4"):
+            for _t in get_form4_trades(since_date=_since_iso, limit=2000):
+                if _port_tickers is not None and _t.get("ticker") not in _port_tickers:
+                    continue
+                if _rt_ticker and _t.get("ticker") != _rt_ticker:
+                    continue
+                _code    = _t.get("transaction_code","")
+                _action  = {"P": "PURCHASE", "S": "SALE", "A": "AWARD"}.get(_code, _code)
+                _total   = _t.get("total_value")
+                _rt_rows.append({
+                    "Source":    "Form 4",
+                    "Date":      _t.get("filing_date",""),
+                    "Ticker":    _t.get("ticker",""),
+                    "Person":    _t.get("insider_name",""),
+                    "Party":     _t.get("insider_title",""),
+                    "Action":    _action,
+                    "Amount":    f"${_total:,.0f}" if _total else "",
+                    "Asset":     (_t.get("company") or "")[:45],
+                })
+
+        if not _rt_rows:
+            st.info("No trades found. Try widening the date range or disabling 'Portfolio only'.")
+        else:
+            st.caption(f"{len(_rt_rows)} trade(s)")
+            _df_rt = pd.DataFrame(_rt_rows).sort_values("Date", ascending=False)
+            st.dataframe(_df_rt, use_container_width=True, height=480, hide_index=True)
+
+            # Download
+            _csv_rt = _df_rt.to_csv(index=False).encode()
+            st.download_button(
+                "Download CSV", _csv_rt, file_name="insider_trades.csv",
+                mime="text/csv", key="ins_dl_csv",
+            )
+
+    # =========================================================================
+    # TAB 4 — Scored Trades (portfolio-correlated, with price impact lookup)
+    # =========================================================================
+    with _ins_tab_scored:
+        _sc_c1, _sc_c2 = st.columns([2, 2])
+        _sc_days   = _sc_c1.selectbox(
+            "Look-back", [7, 14, 30, 60, 90], index=2, key="ins_sc_days",
+            format_func=lambda x: f"Last {x} days",
+        )
+        _sc_thresh = _sc_c2.slider("Min score", 0, 10, 5, key="ins_sc_thresh")
+
+        _scored = [s for s in get_scored_trades(since_days=_sc_days) if s["score"] >= _sc_thresh]
+
+        if not _scored:
+            st.info("No matching insider trades for current portfolio + score filter.")
+        else:
+            st.caption(f"{len(_scored)} trade(s) · score ≥ {_sc_thresh} · sorted by score")
+            for _idx, _s in enumerate(_scored):
+                _stype = _s["type"]
+                _sc    = _s["score"]
+                _tick  = _s.get("ticker","?")
+                _dir   = _s.get("p_direction","long").upper()
+                _sc_color = "#EF4444" if _sc >= 8 else "#FCD34D" if _sc >= 6 else "#94A3B8"
+                _dir_color = "#10B981" if _dir == "LONG" else "#EF4444"
+                _bg = "#1C0000" if _sc >= 8 else "#1A1200" if _sc >= 6 else "#0A1220"
+
+                if _stype == "congress":
+                    _who     = _s.get("politician","?")
+                    _act     = (_s.get("transaction_type") or "").upper()
+                    _amt     = _s.get("amount_str","?")
+                    _trade_date = _s.get("disclosure_date","?")
+                    _detail  = f"{_who} · {_act} · {_amt} · disclosed {_trade_date}"
+                    _src_badge = f'<span style="color:#60A5FA;font-size:.68rem;font-weight:600">{(_s.get("source") or "").upper()}</span>'
+                else:
+                    _who     = _s.get("insider_name","?")
+                    _ttl     = _s.get("insider_title","")
+                    _code    = _s.get("transaction_code","")
+                    _act     = {"P":"PURCHASE","S":"SALE","A":"AWARD"}.get(_code,_code)
+                    _tv      = _s.get("total_value")
+                    _tv_s    = f"${_tv:,.0f}" if _tv else ""
+                    _trade_date = _s.get("filing_date","?")
+                    _detail  = f"{_who} ({_ttl}) · {_act} {_tv_s} · filed {_trade_date}"
+                    _src_badge = '<span style="color:#A78BFA;font-size:.68rem;font-weight:600">FORM 4</span>'
+
+                _card_l, _card_r = st.columns([5, 1])
+                _card_l.markdown(
+                    f'<div style="background:{_bg};border-left:3px solid {_sc_color};'
+                    f'border-radius:6px;padding:.65rem .9rem">'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                    f'<span style="color:#E2E8F0;font-weight:700;font-size:.95rem">{_tick}</span>'
+                    f'<span>{_src_badge} &nbsp; '
+                    f'<span style="color:{_sc_color};font-weight:700">Score {_sc:.0f}/10</span></span></div>'
+                    f'<div style="font-size:.78rem;color:#64748B;margin:.2rem 0">{_detail}</div>'
+                    f'<div style="font-size:.72rem;color:{_dir_color}">Your position: {_dir}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                if _card_r.button("Price impact", key=f"ins_pi_{_idx}", help="Fetch price return after disclosure"):
+                    _pi = get_price_impact(_tick, _trade_date)
+                    if _pi:
+                        _base = _pi["price_at_disclosure"]
+                        _pi_parts = [f"${_base:.2f} at disclosure"]
+                        for _d in [5, 10, 20, 30]:
+                            _r = _pi.get(f"return_{_d}d")
+                            if _r is not None:
+                                _rc_color = "green" if _r >= 0 else "red"
+                                _pi_parts.append(f"{_d}d: **:{_rc_color}[{_r:+.1f}%]**")
+                        st.markdown("  ·  ".join(_pi_parts))
+                    else:
+                        st.warning(f"No price data for {_tick} around {_trade_date}")
+
+    # =========================================================================
+    # TAB 5 — Analytics (clusters, hot tickers, politician leaderboard)
+    # =========================================================================
+    with _ins_tab_analytics:
+        _an_sub1, _an_sub2, _an_sub3 = st.tabs(["Cluster Detector", "Hot Tickers", "Politician Leaderboard"])
+
+        # ── Cluster Detector ─────────────────────────────────────────────────
+        with _an_sub1:
+            st.markdown(
+                "**Cluster** = multiple distinct congress members trading the same ticker "
+                "in the selected window. High cluster size = consensus signal."
+            )
+            _cl_c1, _cl_c2 = st.columns(2)
+            _cl_days = _cl_c1.selectbox(
+                "Window", [14, 30, 60, 90], index=1, key="ins_cl_days",
+                format_func=lambda x: f"Last {x} days",
+            )
+            _cl_min = _cl_c2.slider("Min politicians", 2, 10, 3, key="ins_cl_min")
+
+            _clusters = get_cluster_trades(since_days=_cl_days, min_cluster=_cl_min)
+
+            if not _clusters:
+                st.info(f"No clusters found with ≥ {_cl_min} politicians in last {_cl_days} days.")
+            else:
+                st.caption(f"{len(_clusters)} cluster(s) detected")
+                for _cl in _clusters:
+                    _cl_action = _cl["action"]
+                    _cl_color  = "#10B981" if _cl_action == "BUY" else "#EF4444"
+                    _cl_bg     = "#001A0E" if _cl_action == "BUY" else "#1C0000"
+                    _amt_s     = f"${_cl['total_amount_low']:,.0f}+" if _cl["total_amount_low"] else ""
+                    _pols_s    = ", ".join(_cl["politicians"][:4])
+                    if len(_cl["politicians"]) > 4:
+                        _pols_s += f" +{len(_cl['politicians'])-4} more"
+                    st.markdown(
+                        f'<div style="background:{_cl_bg};border:1px solid {_cl_color}44;'
+                        f'border-radius:8px;padding:.7rem .9rem;margin:.4rem 0">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                        f'<span style="color:#E2E8F0;font-weight:700;font-size:.95rem">{_cl["ticker"]}</span>'
+                        f'<span style="color:{_cl_color};font-weight:700">{_cl_action} cluster · '
+                        f'{_cl["cluster_size"]} politicians</span></div>'
+                        f'<div style="font-size:.77rem;color:#64748B;margin:.2rem 0">{_pols_s}</div>'
+                        f'<div style="display:flex;gap:1.2rem;margin-top:.3rem;font-size:.73rem">'
+                        f'<span style="color:#10B981">▲ {_cl["buys"]} buys</span>'
+                        f'<span style="color:#EF4444">▼ {_cl["sells"]} sells</span>'
+                        f'<span style="color:#94A3B8">{_amt_s}</span>'
+                        f'<span style="color:#475569">Latest: {_cl["latest_date"]}</span>'
+                        f'<span style="color:#475569">Party: {_cl["party_bias"]}</span></div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+        # ── Hot Tickers ───────────────────────────────────────────────────────
+        with _an_sub2:
+            st.markdown(
+                "Most-traded tickers by congress members — "
+                "regardless of your portfolio. Useful for discovering opportunities."
+            )
+            _ht_c1, _ht_c2 = st.columns(2)
+            _ht_days  = _ht_c1.selectbox(
+                "Window", [7, 14, 30, 60, 90], index=2, key="ins_ht_days",
+                format_func=lambda x: f"Last {x} days",
+            )
+            _ht_limit = _ht_c2.slider("Show top N", 5, 30, 15, key="ins_ht_limit")
+
+            _hot = get_top_congress_tickers(since_days=_ht_days, limit=_ht_limit)
+            if not _hot:
+                st.info("No congressional trading data. Run a refresh first.")
+            else:
+                _hot_df = pd.DataFrame([
+                    {
+                        "Ticker":       h["ticker"],
+                        "Total trades": h["total_trades"],
+                        "Buys":         h["buys"],
+                        "Sells":        h["sells"],
+                        "Net":          h["net_bias"],
+                        "Bias":         h["bias"].capitalize(),
+                        "Politicians":  h["politician_count"],
+                        "Est. Amount":  f"${h['total_amount_low']:,.0f}+" if h["total_amount_low"] else "",
+                        "Latest":       h["latest"],
+                    }
+                    for h in _hot
+                ])
+
+                def _bias_style(v: str) -> str:
+                    if v == "Bullish":
+                        return "color: #10B981"
+                    if v == "Bearish":
+                        return "color: #EF4444"
+                    return "color: #94A3B8"
+
+                st.dataframe(
+                    _hot_df.style.map(_bias_style, subset=["Bias"]),
+                    use_container_width=True,
+                    height=420,
+                    hide_index=True,
+                )
+
+        # ── Politician Leaderboard ────────────────────────────────────────────
+        with _an_sub3:
+            st.markdown("Most active congress members over the last 365 days.")
+            _pl_min = st.slider("Min trades", 1, 20, 3, key="ins_pl_min")
+            _pol_stats = get_politician_stats(since_days=365, min_trades=_pl_min)
+
+            if not _pol_stats:
+                st.info("No data. Run a refresh to populate congressional trades.")
+            else:
+                _pol_df = pd.DataFrame([
+                    {
+                        "Politician":   p["politician"],
+                        "Party":        p["party"],
+                        "State":        p["state"],
+                        "Total":        p["total"],
+                        "Buys":         p["buys"],
+                        "Sells":        p["sells"],
+                        "Buy %":        f'{p["buy_pct"]}%',
+                        "Tickers":      p["ticker_count"],
+                        "Est. Amount":  f"${p['total_amount_low']:,.0f}+" if p["total_amount_low"] else "",
+                        "Latest":       p["latest"],
+                    }
+                    for p in _pol_stats
+                ])
+
+                # Party colouring
+                def _party_style(v: str) -> str:
+                    if v in ("R", "Republican"):
+                        return "color: #F87171"
+                    if v in ("D", "Democrat"):
+                        return "color: #60A5FA"
+                    return ""
+
+                st.dataframe(
+                    _pol_df.style.map(_party_style, subset=["Party"]),
+                    use_container_width=True,
+                    height=500,
+                    hide_index=True,
+                )
+
+    # =========================================================================
+    # TAB 6 — Alert History
+    # =========================================================================
+    with _ins_tab_alerts:
+        _ah_limit = st.slider("Show last N alerts", 10, 200, 50, key="ins_ah_limit")
+        _hist = get_alert_history(limit=_ah_limit)
+
+        if not _hist:
+            st.info("No alerts have been sent yet.")
+        else:
+            st.caption(f"{len(_hist)} alert(s) on record")
+            _ah_df = pd.DataFrame([
+                {
+                    "Sent":       h.get("sent_at","")[:16].replace("T"," "),
+                    "Ticker":     h.get("ticker",""),
+                    "Type":       h.get("trade_type","").capitalize(),
+                    "Who":        h.get("who","") or "",
+                    "Action":     (h.get("action") or "").upper(),
+                    "Amount":     h.get("amount","") or "",
+                    "Trade Date": h.get("trade_date","") or "",
+                }
+                for h in _hist
+            ]).sort_values("Sent", ascending=False)
+            st.dataframe(_ah_df, use_container_width=True, height=460, hide_index=True)
+
+
+# =============================================================================
+# PAGE: MOMENTUM ALERTS
+# =============================================================================
+
+def page_momentum():  # noqa: C901
+    """Russell 2000 short-term momentum alerts — price spikes and volume surges."""
+    st.markdown("## Momentum Alerts")
+    st.markdown(
+        '<p style="color:#64748B;margin-top:-.5rem">Russell 2000 — real-time price & volume burst detection</p>',
+        unsafe_allow_html=True,
+    )
+
+    try:
+        from p5_insider.momentum_scanner import (
+            get_recent_alerts,
+            PRICE_SPIKE_PCT, PRICE_WINDOW_MIN,
+            VOLUME_SURGE_RATIO, COOLDOWN_HOURS,
+        )
+    except Exception as e:
+        st.error(f"Momentum scanner unavailable: {e}")
+        return
+
+    # ── Config banner ─────────────────────────────────────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+    _card = "background:#0A1220;border:1px solid #0C1524;border-radius:10px;padding:.7rem 1rem"
+    _lbl  = "font-size:.6rem;color:#475569;font-weight:600;text-transform:uppercase;letter-spacing:.08em"
+    _val  = "font-size:1.1rem;font-weight:700;color:#E2E8F0"
+    c1.markdown(
+        f'<div style="{_card}"><div style="{_lbl}">Price Spike</div>'
+        f'<div style="{_val}">&ge;{PRICE_SPIKE_PCT:.0f}% in {PRICE_WINDOW_MIN}min</div></div>',
+        unsafe_allow_html=True,
+    )
+    c2.markdown(
+        f'<div style="{_card}"><div style="{_lbl}">Volume Surge</div>'
+        f'<div style="{_val}">&ge;{VOLUME_SURGE_RATIO:.0f}&times; avg hourly</div></div>',
+        unsafe_allow_html=True,
+    )
+    c3.markdown(
+        f'<div style="{_card}"><div style="{_lbl}">Alert Cooldown</div>'
+        f'<div style="{_val}">{COOLDOWN_HOURS:.0f}h per ticker</div></div>',
+        unsafe_allow_html=True,
+    )
+    c4.markdown(
+        f'<div style="{_card}"><div style="{_lbl}">Universe</div>'
+        f'<div style="{_val}">Russell 2000</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("")
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    f1, f2, f3 = st.columns([2, 2, 3])
+    hours_back = f1.selectbox("Show last", [4, 8, 24, 48, 168], index=2,
+                              format_func=lambda h: f"{h}h" if h < 168 else "7 days")
+    sig_filter = f2.selectbox("Signal type", ["All", "price_spike", "volume_surge"])
+    f3.write("")
+
+    # ── Load alerts ───────────────────────────────────────────────────────────
+    try:
+        alerts = get_recent_alerts(hours=hours_back, limit=500)
+    except Exception as e:
+        st.error(f"Could not load alert history: {e}")
+        return
+
+    if sig_filter != "All":
+        alerts = [a for a in alerts if a.get("signal_type") == sig_filter]
+
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    n_total  = len(alerts)
+    n_spikes = sum(1 for a in alerts if a.get("signal_type") == "price_spike")
+    n_surges = sum(1 for a in alerts if a.get("signal_type") == "volume_surge")
+    n_up     = sum(1 for a in alerts if a.get("direction") == "up")
+    n_down   = n_total - n_up
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Total alerts", n_total)
+    m2.metric("Price spikes", n_spikes)
+    m3.metric("Volume surges", n_surges)
+    m4.metric("Bullish", n_up)
+    m5.metric("Bearish", n_down)
+
+    st.markdown("---")
+
+    # ── Alert feed ────────────────────────────────────────────────────────────
+    if not alerts:
+        st.info("No alerts in this window. Scanner fires every 5 minutes during US market hours.")
+        return
+
+    try:
+        from zoneinfo import ZoneInfo
+        _ET = ZoneInfo("America/New_York")
+    except Exception:
+        _ET = None
+
+    def _fmt_ts(iso: str) -> str:
+        try:
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if _ET:
+                dt = dt.astimezone(_ET)
+            return dt.strftime("%b %d  %H:%M ET")
+        except Exception:
+            return iso[:16]
+
+    def _sig_badge(stype: str) -> str:
+        if stype == "price_spike":
+            return (
+                '<span class="orca-badge" style="background:#0D1F3C;color:#60A5FA;'
+                'border:1px solid #1E3A5F">PRICE SPIKE</span>'
+            )
+        if stype == "volume_surge":
+            return (
+                '<span class="orca-badge" style="background:#1C0D3C;color:#C084FC;'
+                'border:1px solid #3D1A7A">VOL SURGE</span>'
+            )
+        return f'<span class="orca-badge b-neutral">{stype.upper()}</span>'
+
+    def _dir_badge(direction: str) -> str:
+        if direction == "up":
+            return '<span class="orca-badge b-win">UP</span>'
+        return '<span class="orca-badge b-loss">DOWN</span>'
+
+    for a in alerts:
+        pct       = a.get("pct_change") or 0.0
+        price     = a.get("price") or 0.0
+        vol_ratio = a.get("volume_ratio")
+        vol_s     = f"  &nbsp;&nbsp;vol <b>{vol_ratio:.1f}x</b>" if vol_ratio else ""
+        pct_color = "#10B981" if pct >= 0 else "#EF4444"
+        pct_sign  = f"+{pct:.1f}" if pct >= 0 else f"{pct:.1f}"
+        ts_s      = _fmt_ts(a.get("triggered_at", ""))
+
+        st.markdown(
+            f'<div class="signal-row" style="justify-content:space-between">'
+            f'<div style="display:flex;align-items:center;gap:.75rem">'
+            f'<span style="font-weight:700;color:#F1F5F9;font-size:.95rem;'
+            f'font-family:monospace;min-width:4rem">{a["ticker"]}</span>'
+            f'{_sig_badge(a.get("signal_type",""))}'
+            f'{_dir_badge(a.get("direction","up"))}'
+            f'<span style="color:{pct_color};font-weight:600">{pct_sign}%</span>'
+            f'{vol_s}'
+            f'<span style="color:#64748B;font-size:.8rem">price: ${price:,.4g}</span>'
+            f'</div>'
+            f'<span style="color:#334155;font-size:.78rem">{ts_s}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Raw table (expandable) ────────────────────────────────────────────────
+    with st.expander("Raw data table"):
+        df_raw = pd.DataFrame([
+            {
+                "Time (ET)":   _fmt_ts(a.get("triggered_at", "")),
+                "Ticker":      a.get("ticker", ""),
+                "Signal":      a.get("signal_type", "").replace("_", " ").title(),
+                "Direction":   a.get("direction", "").capitalize(),
+                "% Change":    round(a.get("pct_change") or 0, 2),
+                "Vol Ratio":   a.get("volume_ratio"),
+                "Price":       a.get("price"),
+            }
+            for a in alerts
+        ])
+        st.dataframe(df_raw, use_container_width=True, hide_index=True)
+
+
+# =============================================================================
+# AUTH GATE — checked once per session before any UI renders
+# =============================================================================
+from core.auth import is_authenticated  # noqa: E402
+from ui.login import render_login_page  # noqa: E402
+
+if not is_authenticated():
+    render_login_page()
+    st.stop()
 
 
 # =============================================================================
 # SIDEBAR + ROUTING
 # =============================================================================
-PAGES=["Dashboard","Market Pulse","Market Analysis","Strategies","Journal","How to Use","Settings"]
+PAGES=["Dashboard","Market Pulse","Market Analysis","Strategies","Journal","Insider","Momentum","How to Use","Settings"]
 ICONS={"Dashboard":"🏠","Market Pulse":"🌊","Market Analysis":"📊",
-       "Strategies":"⚡","Journal":"📓","How to Use":"📖","Settings":"⚙️"}
+       "Strategies":"⚡","Journal":"📓","Insider":"🕵️","Momentum":"🚀","How to Use":"📖","Settings":"⚙️"}
 _NAV_LABELS=[f"{ICONS[p]}  {p}" for p in PAGES]
 
 def _on_nav_change():
@@ -4896,15 +5729,18 @@ with st.sidebar:
         'Trading Intelligence Platform</div>',
         unsafe_allow_html=True)
 
+    from core.demo_limit import is_demo_mode as _is_demo_mode, render_owner_unlock as _render_owner_unlock
+    if _is_demo_mode():
+        _render_owner_unlock()
+
     # ── Alert banners ─────────────────────────────────────────────────────────
-    if _lic_offline_days is not None:
-        st.markdown(
-            f'<div style="background:#1C1000;border:1px solid #3a2800;border-radius:6px;'
-            f'padding:.38rem .6rem;font-size:.72rem;color:#FBBF24;margin:.35rem 0">'
-            f'⚠️ Offline mode — license expires in {_lic_offline_days}d<br>'
-            f'<span style="color:#78580A">Connect to internet to re-validate</span></div>',
-            unsafe_allow_html=True)
-    if not os.getenv("TELEGRAM_BOT_TOKEN"):
+    try:
+        from p4_live.journal_supabase import get_user_settings as _gus_sb
+        _sb_us = _gus_sb(st.session_state["supabase_client"])
+        _tg_ok = bool(_sb_us.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN"))
+    except Exception:
+        _tg_ok = bool(os.getenv("TELEGRAM_BOT_TOKEN"))
+    if not _tg_ok:
         st.markdown(
             '<div style="background:#1C1000;border:1px solid #3a2800;border-radius:6px;'
             'padding:.38rem .6rem;font-size:.72rem;color:#FBBF24;margin:.35rem 0">'
@@ -4971,6 +5807,17 @@ with st.sidebar:
         st.rerun()
     st.caption(datetime.now().strftime("%H:%M:%S"))
 
+    st.markdown("---")
+    _user_info = st.session_state.get("user", {})
+    st.markdown(
+        f'<div style="font-size:.7rem;color:#475569;margin-bottom:.4rem">'
+        f'Signed in as<br><span style="color:#94A3B8">{_user_info.get("email","")}</span></div>',
+        unsafe_allow_html=True)
+    if st.button("Sign out", use_container_width=True):
+        from core.auth import logout as _logout
+        _logout()
+        st.rerun()
+
 # Route
 page=st.session_state.get("page","Dashboard")
 if   page=="Dashboard":       page_dashboard()
@@ -4978,5 +5825,7 @@ elif page=="Market Pulse":     page_pulse()
 elif page=="Market Analysis":  page_analysis()
 elif page=="Strategies":       page_strategies()
 elif page=="Journal":          page_journal()
+elif page=="Insider":          page_insider()
+elif page=="Momentum":         page_momentum()
 elif page=="How to Use":       page_howto()
 elif page=="Settings":         page_settings()

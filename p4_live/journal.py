@@ -162,18 +162,68 @@ def _resolve(
 
 def record_signal(signal: dict) -> bool:
     """
-    Persist a fired signal. Returns False if (signal_date, ticker) already recorded.
+    Persist a fired signal. Returns False if already recorded or blocked by conflict resolution.
+
+    Conflict resolution (same ticker, opposite direction):
+      - Filled opposing trade exists → block new pending (cannot auto-close a live position).
+      - Pending opposing trade exists → higher confidence wins; lower-confidence pending is
+        auto-expired and the new signal is recorded. Tie goes to the incumbent (no change).
     """
     conn = _conn()
-    tf = signal.get("timeframe", "1d")
+    tf      = signal.get("timeframe", "1d")
+    ticker  = signal["ticker"]
+    new_dir = signal["direction"]
+    new_conf = signal.get("confidence") or 0.0
+
+    # ── Duplicate guard ───────────────────────────────────────────────────────
     existing = conn.execute(
         "SELECT 1 FROM trades WHERE signal_date=? AND ticker=? AND strategy=? AND timeframe=?",
-        (signal["signal_date"], signal["ticker"], signal.get("strategy", "mtf_trend"), tf),
+        (signal["signal_date"], ticker, signal.get("strategy", "mtf_trend"), tf),
     ).fetchone()
-
     if existing:
         conn.close()
         return False
+
+    # ── Conflict resolution — opposing direction already open on this ticker ──
+    opposing_dir = "short" if new_dir == "long" else "long"
+    conflicts = conn.execute(
+        "SELECT signal_date, ticker, strategy, timeframe, status, confidence "
+        "FROM trades "
+        "WHERE ticker=? AND direction=? AND status IN ('pending','filled')",
+        (ticker, opposing_dir),
+    ).fetchall()
+
+    for c in conflicts:
+        if c["status"] == "filled":
+            # A live position is already running in the opposite direction.
+            # Cannot auto-close — block the new signal.
+            _log(conn, signal["signal_date"], ticker, "signal_blocked",
+                 f"filled {opposing_dir} trade exists "
+                 f"({c['strategy']} {c['signal_date']}) — new {new_dir} blocked")
+            conn.commit()
+            conn.close()
+            return False
+
+        # Pending vs pending — confidence decides
+        incumbent_conf = c["confidence"] or 0.0
+        if new_conf > incumbent_conf:
+            # New signal is better — expire the incumbent
+            conn.execute(
+                "UPDATE trades SET status='expired' "
+                "WHERE signal_date=? AND ticker=? AND strategy=? AND timeframe=? AND status='pending'",
+                (c["signal_date"], c["ticker"], c["strategy"], c["timeframe"]),
+            )
+            _log(conn, c["signal_date"], c["ticker"], "conflict_expired",
+                 f"replaced by {new_dir} {signal.get('strategy')} "
+                 f"(conf {incumbent_conf:.2f} < {new_conf:.2f})")
+        else:
+            # Incumbent has equal or higher confidence — block the new signal
+            _log(conn, signal["signal_date"], ticker, "signal_blocked",
+                 f"pending {opposing_dir} trade ({c['strategy']}) conf={incumbent_conf:.2f} "
+                 f">= new conf={new_conf:.2f} — new {new_dir} blocked")
+            conn.commit()
+            conn.close()
+            return False
 
     conn.execute("""
         INSERT INTO trades (
@@ -181,21 +231,23 @@ def record_signal(signal: dict) -> bool:
             entry_low, entry_high, stop_loss, tp1, tp2,
             tp1_alloc, tp2_alloc, risk_pts, rr, confidence, rationale,
             price_at_signal, atr_at_signal, rsi_at_signal, regime_note,
-            signal_bar_ts, status, recorded_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)
+            signal_bar_ts, notes, source, status, recorded_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)
     """, (
-        signal["signal_date"], signal["ticker"], signal.get("strategy", "mtf_trend"), tf,
-        signal["label"], signal["direction"],
+        signal["signal_date"], ticker, signal.get("strategy", "mtf_trend"), tf,
+        signal["label"], new_dir,
         signal["entry_low"], signal["entry_high"], signal["stop_loss"],
         signal["tp1"], signal.get("tp2"),
         signal.get("tp1_alloc", 70), signal.get("tp2_alloc", 30),
-        signal.get("risk_pts"), signal.get("rr"), signal.get("confidence"),
+        signal.get("risk_pts"), signal.get("rr"), new_conf,
         signal.get("rationale"), signal["price"], signal["atr"], signal["rsi"],
         signal.get("regime"),
         signal.get("signal_bar_ts"),
+        signal.get("notes"),
+        signal.get("source", "scanner"),
         datetime.now(timezone.utc).isoformat(),
     ))
-    _log(conn, signal["signal_date"], signal["ticker"], "signal_recorded",
+    _log(conn, signal["signal_date"], ticker, "signal_recorded",
          f"entry={signal['entry_low']}-{signal['entry_high']} sl={signal['stop_loss']}")
     conn.commit()
     conn.close()
@@ -460,6 +512,38 @@ def get_mt5_open_trades() -> list[dict]:
     rows = conn.execute(
         "SELECT * FROM trades "
         "WHERE status IN ('pending','filled') AND mt5_ticket IS NOT NULL "
+        "ORDER BY signal_date, ticker"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_expired_with_tickets(lookback_days: int = 14) -> list[dict]:
+    """
+    Return recently expired trades that still have MT5 tickets.
+    Used by the monitor to cancel any MT5 limit orders that were left open
+    after the journal expired the signal (the monitor only processes pending/filled,
+    so expired rows with live MT5 orders would otherwise be silently ignored).
+    """
+    from datetime import date, timedelta
+    cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM trades "
+        "WHERE status='expired' AND mt5_ticket IS NOT NULL AND signal_date >= ? "
+        "ORDER BY signal_date, ticker",
+        (cutoff,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_pending_without_ticket() -> list[dict]:
+    """Return pending trades with no MT5 ticket — order placement failed (e.g. market closed)."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM trades "
+        "WHERE status='pending' AND mt5_ticket IS NULL "
         "ORDER BY signal_date, ticker"
     ).fetchall()
     conn.close()

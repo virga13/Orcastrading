@@ -111,11 +111,18 @@ def run_pass1(
                 continue
 
             # Slice — zero lookahead
-            df_slice  = df.iloc[: i + 1].copy()
-            technical = recompute_technical(df_slice, interval)
-            if technical is None:
-                progress.advance(task)
-                continue
+            # Strategies that set uses_bar_slicer=False compute their own indicators
+            # from df directly and don't use the tech dict — skip recompute_technical()
+            # to avoid O(n²) indicator recomputation on every bar.
+            if getattr(strategy, "uses_bar_slicer", True) or use_claude:
+                df_slice  = df.iloc[: i + 1].copy()
+                technical = recompute_technical(df_slice, interval)
+                if technical is None:
+                    progress.advance(task)
+                    continue
+            else:
+                df_slice  = df.iloc[: i + 1]
+                technical = {"current_price": float(df_slice["Close"].iloc[-1]), "interval": interval}
 
             # ── Generate setups ───────────────────────────────────────────────
             if use_claude:
@@ -142,7 +149,6 @@ def run_pass1(
                 time.sleep(0.3)   # Anthropic rate limiting
             else:
                 technical["ticker"] = ticker
-                df_slice = df.iloc[: i + 1].copy()
                 setups_obj = strategy.generate_setups(technical, df_slice)
                 if setups_obj is None:
                     progress.advance(task)

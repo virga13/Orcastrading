@@ -15,6 +15,30 @@ from p3_backtester.strategies.ema_pullback import EMAPullbackStrategy
 from p3_backtester.strategies.mtf_trend import MTFTrendStrategy
 from p3_backtester.strategies.orb import ORBStrategy
 from p3_backtester.strategies.momentum_breakout import MomentumBreakoutStrategy
+from p3_backtester.strategies.gold_scalper import GoldScalperStrategy
+from p3_backtester.strategies.bb_squeeze import BBSqueezeStrategy
+from p3_backtester.strategies.supertrend import SupertrendStrategy
+from p3_backtester.strategies.macd_crossover import MACDCrossoverStrategy
+from p3_backtester.strategies.fibonacci_pullback import FibonacciPullbackStrategy
+from p3_backtester.strategies.rsi_divergence import RSIDivergenceStrategy
+from p3_backtester.strategies.inside_bar import InsideBarStrategy
+from p3_backtester.strategies.donchian_breakout import DonchianBreakoutStrategy
+from p3_backtester.strategies.stochastic_bounce import StochasticBounceStrategy
+from p3_backtester.strategies.engulfing_candle import EngulfingCandleStrategy
+from p3_backtester.strategies.heikin_ashi_trend import HeikinAshiTrendStrategy
+from p3_backtester.strategies.parabolic_sar_flip import ParabolicSARFlipStrategy
+from p3_backtester.strategies.williams_r_reversal import WilliamsRReversalStrategy
+from p3_backtester.strategies.adx_di_crossover import ADXDICrossoverStrategy
+from p3_backtester.strategies.cci_reversal import CCIReversalStrategy
+from p3_backtester.strategies.hammer_reversal import HammerReversalStrategy
+from p3_backtester.strategies.ichimoku_cloud import IchimokuCloudStrategy
+from p3_backtester.strategies.triple_ema_cross import TripleEMACrossStrategy
+from p3_backtester.strategies.bb_bounce import BBBounceStrategy
+from p3_backtester.strategies.roc_momentum import ROCMomentumStrategy
+from p3_backtester.strategies.keltner_breakout import KeltnerBreakoutStrategy
+from p3_backtester.strategies.consecutive_highs import ConsecutiveHighsStrategy
+from p3_backtester.strategies.trix_signal import TRIXSignalStrategy
+from p3_backtester.strategies.price_channel_retest import PriceChannelRetestStrategy
 
 def _get_rule_engine_strategy():
     from p3_backtester.strategies.rule_engine_strategy import RuleEngineStrategy
@@ -47,7 +71,31 @@ def build_from_config(strategy_id: str, param_overrides: dict | None = None) -> 
         "momentum_breakout": lambda p: MomentumBreakoutStrategy(**_kw(MomentumBreakoutStrategy, p)),
         "ema_continuation":  lambda p: EMAContinuationStrategy(**_kw(EMAContinuationStrategy, p)),
         "ema_pullback":      lambda p: EMAPullbackStrategy(**_kw(EMAPullbackStrategy, p)),
-        "rule_engine":       lambda p: _get_rule_engine_strategy()(),
+        "gold_scalper":      lambda p: GoldScalperStrategy(**_kw(GoldScalperStrategy, p)),
+        "bb_squeeze":           lambda p: BBSqueezeStrategy(**_kw(BBSqueezeStrategy, p)),
+        "supertrend":           lambda p: SupertrendStrategy(**_kw(SupertrendStrategy, p)),
+        "macd_crossover":       lambda p: MACDCrossoverStrategy(**_kw(MACDCrossoverStrategy, p)),
+        "fibonacci_pullback":   lambda p: FibonacciPullbackStrategy(**_kw(FibonacciPullbackStrategy, p)),
+        "rsi_divergence":       lambda p: RSIDivergenceStrategy(**_kw(RSIDivergenceStrategy, p)),
+        "inside_bar":           lambda p: InsideBarStrategy(**_kw(InsideBarStrategy, p)),
+        "donchian_breakout":    lambda p: DonchianBreakoutStrategy(**_kw(DonchianBreakoutStrategy, p)),
+        "stochastic_bounce":    lambda p: StochasticBounceStrategy(**_kw(StochasticBounceStrategy, p)),
+        "engulfing_candle":     lambda p: EngulfingCandleStrategy(**_kw(EngulfingCandleStrategy, p)),
+        "heikin_ashi_trend":    lambda p: HeikinAshiTrendStrategy(**_kw(HeikinAshiTrendStrategy, p)),
+        "parabolic_sar_flip":   lambda p: ParabolicSARFlipStrategy(**_kw(ParabolicSARFlipStrategy, p)),
+        "williams_r_reversal":  lambda p: WilliamsRReversalStrategy(**_kw(WilliamsRReversalStrategy, p)),
+        "adx_di_crossover":     lambda p: ADXDICrossoverStrategy(**_kw(ADXDICrossoverStrategy, p)),
+        "cci_reversal":         lambda p: CCIReversalStrategy(**_kw(CCIReversalStrategy, p)),
+        "hammer_reversal":      lambda p: HammerReversalStrategy(**_kw(HammerReversalStrategy, p)),
+        "ichimoku_cloud":       lambda p: IchimokuCloudStrategy(**_kw(IchimokuCloudStrategy, p)),
+        "triple_ema_cross":     lambda p: TripleEMACrossStrategy(**_kw(TripleEMACrossStrategy, p)),
+        "bb_bounce":            lambda p: BBBounceStrategy(**_kw(BBBounceStrategy, p)),
+        "roc_momentum":         lambda p: ROCMomentumStrategy(**_kw(ROCMomentumStrategy, p)),
+        "keltner_breakout":          lambda p: KeltnerBreakoutStrategy(**_kw(KeltnerBreakoutStrategy, p)),
+        "consecutive_highs":         lambda p: ConsecutiveHighsStrategy(**_kw(ConsecutiveHighsStrategy, p)),
+        "trix_signal":               lambda p: TRIXSignalStrategy(**_kw(TRIXSignalStrategy, p)),
+        "price_channel_retest":      lambda p: PriceChannelRetestStrategy(**_kw(PriceChannelRetestStrategy, p)),
+        "rule_engine":               lambda p: _get_rule_engine_strategy()(),
     }
 
     if strategy_id not in _MAP:
@@ -105,6 +153,22 @@ def list_strategies() -> list[str]:
         "momentum_breakout (1d)  — N-day high breakout with volume expansion",
         "ema_continuation  (1d)  — EMA pullback in trending market with ADX filter",
         "ema_pullback      (1d)  — deep EMA overshoot bounce at structural support",
+        "gold_scalper      (5m)  — BRK Gold Scalper v2: M30/M15/M5 composite score, ATR SL/TP",
+        "bb_squeeze        (1d)  — Bollinger Band Squeeze breakout when BB expands outside Keltner",
+        "supertrend        (1d)  — Supertrend ATR crossover with HTF trend filter",
+        "macd_crossover    (1d)  — MACD signal-line crossover with RSI + volume + HTF filters",
+        "fibonacci_pullback(1d)  — Fib retracement pullback at 38.2/50/61.8% after a trend move",
+        "rsi_divergence    (1d)  — RSI divergence at swing pivots signals momentum reversal",
+        "inside_bar        (1d)  — inside bar breakout after strong mother bar",
+        "donchian_breakout (1d)  — Donchian channel N-period high/low breakout (Turtle Trading)",
+        "stochastic_bounce (1d)  — Stochastic %K/%D cross from oversold/overbought with trend filter",
+        "engulfing_candle  (1d)  — bullish/bearish engulfing candle near EMA — trend continuation",
+        "heikin_ashi_trend (1d)  — consecutive bullish HA bars above EMA with no lower wicks",
+        "parabolic_sar_flip(1d)  — Parabolic SAR flip from bearish to bullish in uptrend",
+        "williams_r_reversal(1d) — Williams %R oversold cross-up in established uptrend",
+        "adx_di_crossover  (1d)  — ADX DI+/DI- crossover with rising ADX and EMA trend filter",
+        "cci_reversal       (1d)  — CCI oversold cross-up in uptrend — higher signal frequency than %R",
+        "hammer_reversal    (1d)  — Hammer/pin bar rejection candle near EMA support",
         "rule_engine             — deterministic rule-based setups (default/legacy)",
     ]
 

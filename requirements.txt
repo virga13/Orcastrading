@@ -12,6 +12,9 @@ twelvedata>=1.2.0             # Twelve Data API (optional)
 # Technical indicators
 ta>=0.11.0
 
+# HTML parsing (used by pd.read_html for index ticker lists)
+lxml>=5.0.0
+
 # Macro & news data
 fredapi>=0.5.2
 newsapi-python>=0.2.7
@@ -32,8 +35,8 @@ plotly>=5.18.0
 # CLI output
 rich>=13.0.0
 
-# Licensing
-py-machineid>=0.3.0
+# Auth & multi-user backend
+supabase==2.9.1
 
 # MT5 execution (Windows only — install manually if using MT5 live trading)
 # MetaTrader5>=5.0.45

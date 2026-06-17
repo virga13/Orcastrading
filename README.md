@@ -1,14 +1,43 @@
 # Orcastrading
 
-A modular trading intelligence system built in sequential phases, each feeding into the next.
+A modular trading intelligence platform built in sequential phases, each feeding into the next — AI-driven asset analysis, a historical strategy backtester, a live multi-asset scanner with MT5 execution, an insider/momentum tracker, and a Streamlit dashboard tying it all together.
+
+---
+
+## Quickstart (dashboard, no API keys needed)
+
+The Streamlit UI (`ui/app.py`) has a built-in **dev mode** that skips the Supabase login and runs entirely against a local SQLite journal, so you can explore the full dashboard without provisioning any backend.
+
+```bash
+git clone <this-repo>
+cd Orcastrading
+pip install -r requirements.txt
+
+# create a .env with just this line:
+echo "ORCA_DEV_MODE=1" > .env
+
+streamlit run ui/app.py
+```
+
+This gets you the Dashboard, Strategies, Journal, Insider, Momentum, and Settings pages backed by sample/local data. Live scanning, MT5 execution, and the P1 AI analysis CLI need real API keys (see each phase's Setup section below) — everything else works out of the box.
 
 ---
 
 ## Architecture Overview
 
 ```
-P1 → P2 → P3 → P4 → P5 → P6
+P1 → P2 → P3 → P4 → P5
+                ↓
+         Streamlit UI (ui/app.py)
 ```
+
+| Phase | What it does | Status |
+|-------|-------------|--------|
+| P1 | Claude-driven asset analysis → bias + trade setups | Complete |
+| P2 | Trade setup decision tree | Integrated into P1 |
+| P3 | Historical strategy backtester (signal gen + simulation) | Complete |
+| P4 | Live multi-asset scanner, MT5 execution, trade journal, alerts | Complete |
+| P5 | Insider/momentum tracker (correlator, alerts, analytics) | Complete |
 
 ---
 
@@ -186,21 +215,46 @@ Pass 1 calls Claude once per signal bar. With `session-open` mode on daily candl
 
 ---
 
-### P4 — Trader Personality Profiler `[PLANNED]`
-**Behavioral modeling → risk tolerance mapping → strategy templates per archetype**
+### P4 — Live Scanner, Journal & MT5 Execution `[COMPLETE]`
+**Runs the validated P3 strategies against live market data, journals every signal, and (optionally) executes on a MetaTrader 5 demo account**
 
-Models trader behavior to map individual risk tolerance and psychological tendencies to specific trader archetypes, then surfaces strategy templates suited to each archetype.
+#### Components
+- `p4_live/scanner.py` — scans the configured asset/strategy/timeframe combos (`config/assets.yaml`, `config/strategies.yaml`) for live signals, builds an HTML forward-test report
+- `p4_live/mt5_monitor.py` — places and monitors trades on a MetaTrader 5 terminal (Windows only, demo account recommended); guarded by `MT5_ENABLED` in `.env` so it's safe to leave off
+- `p4_live/journal.py` / `p4_live/journal_supabase.py` — SQLite-backed trade journal (single-user/dev mode) and a Supabase-backed equivalent for multi-user deployments, with RLS-enforced isolation
+- `run_scheduler.py` — orchestrates recurring scans, MT5 order retries, risk gate checks (daily/weekly loss limits), and stale-signal detection
+- Alerts via Telegram and/or email (`config/assets.yaml`-driven, see `.env.example`)
+
+#### Usage
+
+```bash
+# One-off scan / CLI
+python -m p4_live
+
+# Continuous scheduler (scans, journals, optionally executes on MT5)
+python run_scheduler.py
+```
+
+#### Setup
+
+MT5 execution requires `pip install MetaTrader5` (commented out in `requirements.txt` since it's Windows-only) and a running MT5 terminal logged into a demo/live account. Leave `MT5_ENABLED=false` to scan and journal without placing any trades.
 
 ---
 
-### P5 — Lock-in Trade Journal `[PLANNED]`
-**Trade entry locked once opened — discipline enforcement, statistical data integrity**
+### Multi-user / SaaS mode `[COMPLETE]`
 
-A write-once trade journal where entries are locked upon creation. Enforces trading discipline and ensures statistical integrity of the performance dataset.
+The Streamlit UI supports two backends:
+
+- **Dev mode** (`ORCA_DEV_MODE=1`, no Supabase env vars) — single local user, SQLite journal, no login screen. This is the default for running the project locally.
+- **Supabase mode** (`SUPABASE_URL` + `SUPABASE_ANON_KEY` set) — full auth (login/register/reset password), per-user data isolation via Postgres RLS (`supabase/schema.sql`), and `journal_supabase.py` instead of the local journal. Intended for a hosted multi-user deployment.
 
 ---
 
-### P6 — Parallel Trading Profiles `[PLANNED]`
-**Shadow strategies running in parallel — alternative exits, regime adaptations, A/B testing**
+### P5 — Insider & Momentum Tracker `[COMPLETE]`
+**Correlates insider-style signals and momentum spikes across assets, with its own alerting and analytics**
 
-Runs shadow strategies alongside live trades to test alternative exits, adapt to changing market regimes, and A/B test strategy variants without affecting the live position.
+- `p5_insider/correlator.py` — cross-asset signal correlation
+- `p5_insider/momentum_scanner.py` — momentum spike detection
+- `p5_insider/analytics.py`, `p5_insider/db.py`, `p5_insider/alerts.py` — supporting analytics, persistence, and Telegram alerts
+
+Surfaced in the Streamlit UI under the **Insider** and **Momentum** pages.
